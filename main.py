@@ -23,20 +23,20 @@ from bs4 import BeautifulSoup
 
 @dataclass
 class Racer:
-    boat: int          # 艇番 (1-6)
-    name: str          # 選手名
-    rank: str          # 級別 ('A1', 'A2', 'B1', 'B2')
+    boat: int            # 艇番 (1-6)
+    name: str            # 選手名
+    rank: str            # 級別 ('A1', 'A2', 'B1', 'B2')
     win_rate_nat: float  # 全国勝率
     win_rate_loc: float  # 当地勝率
 
 @dataclass
 class RaceInfo:
-    stadium: str       # 競艇場名
-    race_no: int       # レース番号 (1-12)
-    race_type: str     # '優勝戦', '準優勝戦', 'ドリーム戦', '女子戦', '一般予選', '企画'
-    is_girls: bool     # 女子戦フラグ
-    weather_bad: bool  # 荒天フラグ
-    racers: List[Racer]# 1〜6号艇の選手データリスト
+    stadium: str         # 競艇場名
+    race_no: int         # レース番号 (1-12)
+    race_type: str       # '優勝戦', '準優勝戦', 'ドリーム戦', '女子戦', '一般予選', '企画'
+    is_girls: bool       # 女子戦フラグ
+    weather_bad: bool    # 荒天フラグ
+    racers: List[Racer]  # 1〜6号艇の選手データリスト
 
 # ==========================================
 # ロジック1：つーちゃん舟券ロジック
@@ -126,39 +126,39 @@ class TsuChanEngine:
         }
 
 # ==========================================
-# ロジック2：堅実イン逃げ・外切りロジック（1-234-234）
+# ロジック2：堅実イン逃げ式（全国+当地フィルター版）
 # ==========================================
 
 class SolidEscapeEngine:
-    """1-234-234 厳選6点 堅実投資エンジン（1Rあたり800〜1,000円）"""
+    """1-234-234 厳選6点 堅実投資エンジン（1Rあたり最大1,000円配分）"""
 
     STRONG_IN_STADIUMS = ['大村', '徳山', '芦屋', '下関', '丸亀', '尼崎']
 
     def evaluate_race(self, race: RaceInfo) -> Tuple[bool, str, str]:
-        # 1. 1号艇：A1 かつ 全国勝率 6.8以上
+        # 1. 1号艇：A1級 かつ 全国勝率 6.30以上
         r1 = race.racers[0]
-        if r1.rank != 'A1' or r1.win_rate_nat < 6.8:
+        if r1.rank != 'A1' or r1.win_rate_nat < 6.30:
             return False, "1号艇の逃げ信頼度不足", "SKIP"
 
-        # 2. 5・6号艇：ともにB級 かつ 全国勝率5.0未満（完全消去条件）
+        # 2. 5・6号艇（消去条件）：
+        #    A1級不在 かつ 全国勝率5.30未満 かつ 当地勝率5.30未満（当地巧者も排除）
         r5 = race.racers[4]
         r6 = race.racers[5]
-        if r5.rank not in ['B1', 'B2'] or r5.win_rate_nat >= 5.0:
-            return False, "5号艇の連絡みリスクあり", "SKIP"
-        if r6.rank not in ['B1', 'B2'] or r6.win_rate_nat >= 5.0:
-            return False, "6号艇の連絡みリスクあり", "SKIP"
+        if r5.rank == 'A1' or r5.win_rate_nat >= 5.30 or r5.win_rate_loc >= 5.30:
+            return False, "5号艇の連絡みリスクあり（全国/当地勝率）", "SKIP"
+        if r6.rank == 'A1' or r6.win_rate_nat >= 5.30 or r6.win_rate_loc >= 5.30:
+            return False, "6号艇の連絡みリスクあり（全国/当地勝率）", "SKIP"
 
-        # 3. 2〜4号艇：壁となる勝率（極端な低勝率を排除）
+        # 3. 2〜4号艇：壁となる勝率（全員4.50以上で大外の差し筋をブロック）
         for r in race.racers[1:4]:
-            if r.win_rate_nat < 4.2:
+            if r.win_rate_nat < 4.50:
                 return False, f"{r.boat}号艇の壁信頼度不足", "SKIP"
 
         confidence = "鉄板（Sランク）" if race.stadium in self.STRONG_IN_STADIUMS else "堅実（Aランク）"
         return True, "1-234-234 成立条件合致", confidence
 
     def generate_bets(self, race: RaceInfo, confidence: str) -> dict:
-        # 傾斜配分（合計1,000円）
-        # 1-2-3 (300円), 1-2-4 (200円), 1-3-2 (200円), 1-3-4 (100円), 1-4-2 (100円), 1-4-3 (100円)
+        # 傾斜配分（合計1,000円以内）
         allocation = [
             ("1-2-3", 300),
             ("1-2-4", 200),
@@ -175,7 +175,7 @@ class SolidEscapeEngine:
             "ロジック": "堅実イン逃げ式 (1-234-234)",
             "レース": f"{race.stadium}{race.race_no}R ({race.race_type})",
             "本命◎": f"1号艇 {race.racers[0].name}",
-            "消し×": f"5号艇 {race.racers[4].name} / 6号艇 {race.racers[5].name}",
+            "切×": f"5号艇 {race.racers[4].name} / 6号艇 {race.racers[5].name}",
             "自信度": confidence,
             "合計投資額": f"{calc_total:,}円",
             "買い目内訳": final_bets
@@ -214,7 +214,6 @@ def fetch_target_races(target_date: str) -> List[RaceInfo]:
 
     for jcd in sorted(list(jcds)):
         stadium_name = STADIUM_MAP.get(jcd, f"場{jcd}")
-        # 全12レースを走査
         for rno in range(1, 13):
             race_url = f"https://www.boatrace.jp/owpc/pc/race/racelist?rno={rno}&jcd={jcd}&hd={target_date}"
             try:
@@ -321,13 +320,13 @@ if __name__ == "__main__":
     solid_bets = []
 
     for r in races:
-        # つーちゃん式スクリーニング (9〜12R)
+        # つーちゃん式 (9〜12R)
         if r.race_no >= 9:
             is_go, _, keyman, conf = tsuchan_engine.evaluate_race(r)
             if is_go and keyman:
                 tsuchan_bets.append(tsuchan_engine.generate_bets(r, keyman, conf))
 
-        # 堅実イン逃げ式スクリーニング (全レース対象)
+        # 堅実イン逃げ式 (全レース対象)
         is_go_s, _, conf_s = solid_engine.evaluate_race(r)
         if is_go_s:
             solid_bets.append(solid_engine.generate_bets(r, conf_s))
@@ -355,7 +354,7 @@ if __name__ == "__main__":
         for idx, item in enumerate(solid_bets, 1):
             msg += f"\n【{idx}】{item['レース']}\n"
             msg += f"◎ {item['本命◎']}\n"
-            msg += f"切 {item['消し×']}\n"
+            msg += f"切 {item['切×']}\n"
             msg += f"自信度: {item['自信度']} / 投資: {item['合計投資額']}\n"
             for b in item["買い目内訳"]:
                 msg += f"・{b['買い目']} : {b['金額']}円\n"
