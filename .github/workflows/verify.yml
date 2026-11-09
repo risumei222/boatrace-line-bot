@@ -1,16 +1,24 @@
 name: verify-data
 
 on:
-  workflow_dispatch: # 手動実行用
+  workflow_dispatch: # いつでも手動実行可能
   schedule:
-    # JST 23:50 (UTC 14:50)
+    # 1. 11/10 23:50 JST (11/10 14:50 UTC)
     - cron: '50 14 * * *'
-    # JST 00:05 (UTC 15:05)
+    # 2. 11/11 00:05 JST (11/10 15:05 UTC)
     - cron: '5 15 * * *'
-    # JST 00:15 (UTC 15:15)
+    # 3. 11/11 00:15 JST (11/10 15:15 UTC)
     - cron: '15 15 * * *'
-    # JST 07:00 (UTC 22:00 前日)
+    # 4. 11/11 01:00 JST (11/10 16:00 UTC)
+    - cron: '0 16 * * *'
+    # 5. 11/11 05:00 JST (11/10 20:00 UTC)
+    - cron: '0 20 * * *'
+    # 6. 11/11 06:00 JST (11/10 21:00 UTC)
+    - cron: '0 21 * * *'
+    # 7. 11/11 07:00 JST (11/10 22:00 UTC)
     - cron: '0 22 * * *'
+    # 8. 11/11 08:00 JST (11/10 23:00 UTC)
+    - cron: '0 23 * * *'
 
 jobs:
   verify:
