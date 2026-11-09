@@ -2,15 +2,16 @@ import os
 import re
 import sys
 import subprocess
-import requests
-from bs4 import BeautifulSoup
 
-# 外部ライブラリ自動インストール
+# 外部ライブラリ自動インストール（必ず最初に実行）
 for pkg in ["requests", "beautifulsoup4"]:
     try:
         __import__(pkg)
     except ImportError:
         subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+
+import requests
+from bs4 import BeautifulSoup
 
 LINE_NOTIFY_TOKEN = os.getenv("LINE_NOTIFY_TOKEN")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
@@ -80,7 +81,7 @@ def main():
             if "3連単" in text:
                 rno_match = re.search(r"(\d+)R", text)
                 rno = int(rno_match.group(1)) if rno_match else 0
-                
+
                 digits = re.findall(r"\b([1-6])\b", text)
                 pay_match = re.search(r"[¥￥]?([0-9,]+)\s*円?", text)
                 payout = pay_match.group(1) if pay_match else "-"
@@ -102,7 +103,7 @@ def main():
         lines.append(f"📍 {r['stadium']} {r['rno']}R : {r['trifecta']} ({r['payout']}円)")
 
     lines.append("\n━━━━━━━━━━━━━━━")
-    lines.append("※この中から『1号艇勝率』や『2号艇との差』をどの水準に置くかで、狙い目レースを最適化できます。")
+    lines.append("※この結果をもとに、1号艇勝率・2号艇差のフィルター基準を最適化します。")
 
     send_notification("\n".join(lines))
     print("LINE送信完了")
