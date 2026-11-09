@@ -126,7 +126,7 @@ class TsuChanEngine:
         }
 
 # ==========================================
-# ロジック2：堅実イン逃げ式（全国+当地フィルター版）
+# ロジック2：堅実イン逃げ式（シード対応・実戦チューニング版）
 # ==========================================
 
 class SolidEscapeEngine:
@@ -135,24 +135,29 @@ class SolidEscapeEngine:
     STRONG_IN_STADIUMS = ['大村', '徳山', '芦屋', '下関', '丸亀', '尼崎']
 
     def evaluate_race(self, race: RaceInfo) -> Tuple[bool, str, str]:
-        # 1. 1号艇：A1級 かつ 全国勝率 6.30以上
+        # 1. 1号艇：A1級 かつ 全国勝率 6.20以上（イン逃げ軸）
         r1 = race.racers[0]
-        if r1.rank != 'A1' or r1.win_rate_nat < 6.30:
+        if r1.rank != 'A1' or r1.win_rate_nat < 6.20:
             return False, "1号艇の逃げ信頼度不足", "SKIP"
 
         # 2. 5・6号艇（消去条件）：
-        #    A1級不在 かつ 全国勝率5.30未満 かつ 当地勝率5.30未満（当地巧者も排除）
+        #    A1級不在 かつ 全国勝率5.40未満（展開を作れない格下選手を排除）
         r5 = race.racers[4]
         r6 = race.racers[5]
-        if r5.rank == 'A1' or r5.win_rate_nat >= 5.30 or r5.win_rate_loc >= 5.30:
-            return False, "5号艇の連絡みリスクあり（全国/当地勝率）", "SKIP"
-        if r6.rank == 'A1' or r6.win_rate_nat >= 5.30 or r6.win_rate_loc >= 5.30:
-            return False, "6号艇の連絡みリスクあり（全国/当地勝率）", "SKIP"
+        if r5.rank == 'A1' or r5.win_rate_nat >= 5.40:
+            return False, "5号艇の連絡みリスクあり", "SKIP"
+        if r6.rank == 'A1' or r6.win_rate_nat >= 5.40:
+            return False, "6号艇の連絡みリスクあり", "SKIP"
 
-        # 3. 2〜4号艇：壁となる勝率（全員4.50以上で大外の差し筋をブロック）
-        for r in race.racers[1:4]:
-            if r.win_rate_nat < 4.50:
-                return False, f"{r.boat}号艇の壁信頼度不足", "SKIP"
+        # 3. 2〜4号艇：壁となる勝率
+        #    シード番組に対応するため、全員3.80以上 かつ 3艇平均4.30以上で判定
+        inner_racers = race.racers[1:4]
+        if any(r.win_rate_nat < 3.80 for r in inner_racers):
+            return False, "内枠に極端な低勝率艇あり", "SKIP"
+        
+        avg_inner_win = sum(r.win_rate_nat for r in inner_racers) / 3.0
+        if avg_inner_win < 4.30:
+            return False, "内枠全体の壁信頼度不足", "SKIP"
 
         confidence = "鉄板（Sランク）" if race.stadium in self.STRONG_IN_STADIUMS else "堅実（Aランク）"
         return True, "1-234-234 成立条件合致", confidence
