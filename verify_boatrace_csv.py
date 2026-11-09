@@ -1,6 +1,7 @@
 """
-BoatraceCSV 第3段階：本番運用前 最終検証スクリプト
-※ 本番main.py、LINE通知、予想ロジックとは完全に分離されています。
+BoatraceCSV 第5段階：当日データ公開時刻の実測 & 公式突合スクリプト
+対象日: 2026年11月11日
+※ 本番Bot・LINE通知・予想エンジンには一切干渉しません。
 """
 
 import io
@@ -10,12 +11,13 @@ import json
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Tuple
 import pandas as pd
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) VerificationScript/3.0"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) VerificationScript/5.0"
 }
+
+TARGET_DATE = "2026/11/11"
 
 CSV_TYPES = [
     ("title", "レースタイトル・開催一覧"),
@@ -24,7 +26,7 @@ CSV_TYPES = [
     ("motor_stats", "モーター成績")
 ]
 
-BASE_17_FIELDS = [
+REQUIRED_17 = [
     "登録番号", "選手名", "級別",
     "全国勝率", "全国2連対率", "全国3連対率",
     "当地勝率", "当地2連対率", "当地3連対率",
@@ -34,161 +36,141 @@ BASE_17_FIELDS = [
 ]
 
 
-def fetch_csv(url: str) -> Tuple[int, bytes, dict, str]:
-    """CSVファイルのHTTPS取得"""
+def test_20261111():
+    jst = timezone(timedelta(hours=9))
+    now_jst = datetime.now(jst)
+    now_utc = datetime.now(timezone.utc)
+
+    print("=" * 65)
+    print(f"【BoatraceCSV 11/11公開実測】")
+    print(f"・JST実行日時: {now_jst.strftime('%Y-%m-%d %H:%M:%S JST')}")
+    print(f"・UTC実行日時: {now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    print("=" * 65)
+
+    data_store = {}
+
+    for c_type, desc in CSV_TYPES:
+        url = f"https://boatracecsv.github.io/data/programs/{c_type}/{TARGET_DATE}.csv"
+        print(f"\n■ {c_type} ({desc})")
+        print(f"・URL: {url}")
+
+        try:
+            req = urllib.request.Request(url, headers=HEADERS)
+            with urllib.request.urlopen(req, timeout=15) as res:
+                raw = res.read()
+                status = res.status
+                lm = res.headers.get("Last-Modified")
+                etag = res.headers.get("ETag")
+                size = len(raw)
+
+                print(f"・HTTPステータス: {status}")
+                print(f"・ファイルサイズ: {size:,} bytes")
+                print(f"・Last-Modified: {lm}")
+                print(f"・ETag: {etag}")
+
+                if size == 0:
+                    print("・判定: EMPTY_FILE (空ファイル)")
+                    continue
+
+                df = None
+                for enc in ["utf-8", "cp932", "shift_jis"]:
+                    try:
+                        df = pd.read_csv(io.StringIO(raw.decode(enc)))
+                        break
+                    except Exception:
+                        continue
+
+                if df is None:
+                    print("・判定: PARSE_FAILED (パース失敗)")
+                    continue
+
+                row_cnt = len(df)
+                col_cnt = len(df.columns)
+                print(f"・CSV行数: {row_cnt} 行 / 列数: {col_cnt} 列")
+
+                # レース場数・コード数
+                stadium_col = next((c for c in ["レース場コード", "場コード", "場名"] if c in df.columns), None)
+                rc_col = next((c for c in ["レースコード", "race_code"] if c in df.columns), None)
+
+                st_cnt = df[stadium_col].nunique() if stadium_col else 0
+                rc_cnt = df[rc_col].nunique() if rc_col else 0
+
+                print(f"・レース場数: {st_cnt} 場")
+                print(f"・レースコード数: {rc_cnt} レース")
+                print("・判定: HTTP 200 (取得成功)")
+
+                data_store[c_type] = df
+
+        except urllib.error.HTTPError as e:
+            print(f"・HTTPステータス: {e.code}")
+            print(f"・判定: HTTP {e.code} (未公開候補)")
+        except Exception as e:
+            print(f"・通信エラー: {e}")
+            print("・判定: FETCH_FAILED")
+
+    # 取得成功判定 (title と race_cards の突き合わせ)
+    print("\n--------------------------------------------------")
+    print("【11/11 取得成功判定】")
+    if "title" in data_store and "race_cards" in data_store:
+        df_t = data_store["title"]
+        df_r = data_store["race_cards"]
+        rc_t = set(df_t["レースコード"])
+        rc_r = set(df_r["レースコード"])
+
+        if rc_t == rc_r and len(rc_t) > 0:
+            print(f"・titleとrace_cardsのレースコード: 完全一致 ({len(rc_t)} レース)")
+            # 6艇×17項目チェック
+            cols = set(df_r.columns)
+            missing = []
+            for p in range(1, 7):
+                for f in REQUIRED_17:
+                    if f"艇{p}_{f}" not in cols:
+                        missing.append(f"艇{p}_{f}")
+
+            if not missing:
+                print("・6艇分の必須17項目: すべて完全一致で存在")
+                print("★【総合判定】: 11/11データ 完全取得成功 (VALIDATED_WITH_RACES)")
+            else:
+                print(f"・必須列不足: {missing[:5]}...")
+        else:
+            print(f"・レースコード不一致: title {len(rc_t)} 件 / race_cards {len(rc_r)} 件")
+    else:
+        print("★【総合判定】: まだ全データが公開されていません (未公開)")
+
+
+def inspect_toda_1r():
+    """11/9 戸田1Rの出走表データを抽出して公式照合用に表示"""
+    print("\n" + "=" * 65)
+    print("【公式照合用: 2026年11月9日 戸田1R 実データ抽出】")
+    print("=" * 65)
+
+    url = "https://boatracecsv.github.io/data/programs/race_cards/2026/11/09.csv"
     try:
         req = urllib.request.Request(url, headers=HEADERS)
         with urllib.request.urlopen(req, timeout=15) as res:
-            raw = res.read()
-            headers = dict(res.headers)
-            return res.status, raw, headers, None
-    except urllib.error.HTTPError as e:
-        return e.code, b"", {}, f"HTTP {e.code}"
+            df = pd.read_csv(io.StringIO(res.read().decode("utf-8")))
+            toda_1r = df[df["レースコード"] == 202611090201]
+
+            if len(toda_1r) == 0:
+                print("戸田1Rが見つかりません。")
+                return
+
+            row = toda_1r.iloc[0]
+            print(f"レース日: {row.get('レース日')} / 場: {row.get('レース場コード')} (戸田) / レース: {row.get('レース回')}")
+            print("\n| 艇 | 登番 | 選手名 | 級別 | 全国勝率 | 2連率 | 当地勝率 | 平均ST | モーター | モータ2連 | ボート |")
+            print("| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
+            for p in range(1, 7):
+                print(f"| {p} | {row.get(f'艇{p}_登録番号')} | {row.get(f'艇{p}_選手名')} | {row.get(f'艇{p}_級別')} | "
+                      f"{row.get(f'艇{p}_全国勝率')} | {row.get(f'艇{p}_全国2連対率')} | {row.get(f'艇{p}_当地勝率')} | "
+                      f"{row.get(f'艇{p}_全国平均ST')} | {row.get(f'艇{p}_モーター番号')} | {row.get(f'艇{p}_モーター2連対率')} | "
+                      f"{row.get(f'艇{p}_ボート番号')} |")
     except Exception as e:
-        return 0, b"", {}, str(e)
-
-
-def decode_to_df(raw: bytes) -> Tuple[pd.DataFrame, str]:
-    """文字コード自動判別デコード"""
-    for enc in ["utf-8", "cp932", "shift_jis"]:
-        try:
-            df = pd.read_csv(io.StringIO(raw.decode(enc)))
-            return df, enc
-        except Exception:
-            continue
-    return None, None
-
-
-def section_a_today():
-    """A. 11月10日当日分の取得検証"""
-    print("=" * 60)
-    print("【A. 2026年11月10日 (当日) 4種類CSV取得結果】")
-    print("=" * 60)
-
-    for c_type, desc in CSV_TYPES:
-        url = f"https://boatracecsv.github.io/data/programs/{c_type}/2026/11/10.csv"
-        status, raw, headers, err = fetch_csv(url)
-        print(f"\n■ {c_type} ({desc})")
-        print(f"・URL: {url}")
-        print(f"・HTTPステータス: {status}")
-        print(f"・サイズ: {len(raw):,} bytes")
-        print(f"・Last-Modified: {headers.get('Last-Modified', 'なし')}")
-        print(f"・ETag: {headers.get('ETag', 'なし')}")
-
-        if status == 200 and len(raw) > 0:
-            df, enc = decode_to_df(raw)
-            if df is not None:
-                print(f"・行数: {len(df)} 行 / 列数: {len(df.columns)} 列")
-                print(f"・文字コード: {enc}")
-                print(f"・判定: VALIDATED_WITH_RACES")
-            else:
-                print("・判定: PARSE_FAILED")
-        else:
-            print(f"・エラー / 未公開: {err}")
-            print(f"・判定: HTTP_NON_200 (未公開または生成前)")
-
-
-def section_b_and_c_yesterday():
-    """B. 11月9日分の再検査 (17項目欠損集計・突合) & C. 24場確認"""
-    print("\n" + "=" * 60)
-    print("【B & C. 2026年11月9日 詳細再検査・24場集計】")
-    print("=" * 60)
-
-    # 1. title取得
-    url_title = "https://boatracecsv.github.io/data/programs/title/2026/11/09.csv"
-    s_t, raw_t, _, _ = fetch_csv(url_title)
-    df_title, _ = decode_to_df(raw_t) if s_t == 200 else (None, None)
-
-    # 2. race_cards取得
-    url_rc = "https://boatracecsv.github.io/data/programs/race_cards/2026/11/09.csv"
-    s_r, raw_r, _, _ = fetch_csv(url_rc)
-    df_rc, _ = decode_to_df(raw_r) if s_r == 200 else (None, None)
-
-    if df_title is None or df_rc is None:
-        print("[ERROR] 11月9日のCSV取得に失敗しました。")
-        return
-
-    # --- C. 開催場数と場別レース数集計 ---
-    print("\n### C. 開催場別レース数と場コード一覧")
-    stadium_col = "レース場" if "レース場" in df_title.columns else "場名"
-    stadium_code_col = "レース場コード" if "レース場コード" in df_title.columns else "場コード"
-
-    stadium_summary = df_title.groupby([stadium_code_col, stadium_col]).size().reset_index(name="レース数")
-    print(f"・開催場数: {len(stadium_summary)} 場 (全国24場中、当日開催があった全場)")
-    print(f"・全レース総数: {len(df_title)} レース")
-    print("\n| 場コード | レース場名 | 開催レース数 |")
-    print("| :---: | :--- | :---: |")
-    for _, row in stadium_summary.iterrows():
-        print(f"| {row[stadium_code_col]:02d} | {row[stadium_col]} | {row['レース数']} R |")
-
-    # --- B. title と race_cards のレースコード突合 ---
-    print("\n### B-1. title と race_cards のレースコード突合結果")
-    rc_title = set(df_title["レースコード"].dropna())
-    rc_cards = set(df_rc["レースコード"].dropna())
-
-    only_title = rc_title - rc_cards
-    only_cards = rc_cards - rc_title
-    both = rc_title & rc_cards
-
-    dup_title = len(df_title) - df_title["レースコード"].nunique()
-    dup_cards = len(df_rc) - df_rc["レースコード"].nunique()
-
-    print(f"・title総レースコード数: {len(rc_title)}")
-    print(f"・race_cards総レースコード数: {len(rc_cards)}")
-    print(f"・両方に存在する完全一致レース: {len(both)}")
-    print(f"・titleにのみ存在: {len(only_title)} 件 {only_title if only_title else ''}")
-    print(f"・race_cardsにのみ存在: {len(only_cards)} 件 {only_cards if only_cards else ''}")
-    print(f"・title側 重複レースコード: {dup_title} 件")
-    print(f"・race_cards側 重複レースコード: {dup_cards} 件")
-
-    # --- B-2. 6艇×17項目の存在と値入力（欠損）詳細検査 ---
-    print("\n### B-2. 6艇×17項目のカラム存在と値充足検査 (132レース対象)")
-    total_races = len(df_rc)
-    present_cols = set(df_rc.columns)
-
-    print("\n【集計サマリー: 艇番別・17項目の欠損状況】")
-    for pit in range(1, 7):
-        print(f"\n--- ■ 艇番 {pit} (全{total_races}レース中) ---")
-        print("| 検査項目名 | 実際のカラム名 | 列存在 | 入力済(値あり) | 欠損数 | 充足率 |")
-        print("| :--- | :--- | :---: | :---: | :---: | :---: |")
-
-        for base_field in BASE_17_FIELDS:
-            col_name = f"艇{pit}_{base_field}"
-            if col_name in present_cols:
-                valid_cnt = int(df_rc[col_name].notna().sum())
-                null_cnt = int(df_rc[col_name].isna().sum())
-                rate = round(valid_cnt / total_races * 100, 1)
-                print(f"| {base_field} | `{col_name}` | ○ | {valid_cnt} | {null_cnt} | {rate}% |")
-            else:
-                print(f"| {base_field} | `{col_name}` | × (未検出) | 0 | {total_races} | 0.0% |")
-
-
-def section_d_timeline():
-    """D. 00:00 vs 07:00 公開時刻の比較とスケジュール確認"""
-    jst = timezone(timedelta(hours=9))
-    now_jst = datetime.now(jst)
-    print("\n" + "=" * 60)
-    print(f"【D. 公開時刻検証 (実行基準時刻: {now_jst.strftime('%Y-%m-%d %H:%M:%S JST')})】")
-    print("=" * 60)
-
-    print("・11月10日 (当日分) 現実点での取得状態: 上記Aの結果を参照")
-    print("・11月11日 (翌日分) 各時刻の検査状態:")
-    print("  - 11/10 23:50 JST: 【未実施】(未来時刻のためActions cronにて予約実行)")
-    print("  - 11/11 00:05 JST: 【未実施】(未来時刻のためActions cronにて予約実行)")
-    print("  - 11/11 00:15 JST: 【未実施】(未来時刻のためActions cronにて予約実行)")
-    print("  - 11/11 07:00 JST: 【未実施】(未来時刻のためActions cronにて予約実行)")
+        print(f"戸田1R抽出エラー: {e}")
 
 
 def main():
-    jst = timezone(timedelta(hours=9))
-    print(f"############################################################")
-    print(f" BoatraceCSV 第3段階 本番前最終検証")
-    print(f" 実行時刻: {datetime.now(jst).strftime('%Y-%m-%d %H:%M:%S JST')}")
-    print(f"############################################################\n")
-
-    section_a_today()
-    section_b_and_c_yesterday()
-    section_d_timeline()
+    test_20261111()
+    inspect_toda_1r()
 
 
 if __name__ == "__main__":
