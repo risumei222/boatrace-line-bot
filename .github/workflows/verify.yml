@@ -1,6 +1,16 @@
 name: verify-data
+
 on:
-  workflow_dispatch:
+  workflow_dispatch: # 手動実行用
+  schedule:
+    # JST 23:50 (UTC 14:50)
+    - cron: '50 14 * * *'
+    # JST 00:05 (UTC 15:05)
+    - cron: '5 15 * * *'
+    # JST 00:15 (UTC 15:15)
+    - cron: '15 15 * * *'
+    # JST 07:00 (UTC 22:00 前日)
+    - cron: '0 22 * * *'
 
 jobs:
   verify:
