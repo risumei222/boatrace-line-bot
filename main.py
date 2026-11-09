@@ -48,13 +48,7 @@ def send_notification(message: str):
         try:
             session.post("https://api.line.me/v2/bot/message/push",
                          headers={"Content-Type": "application/json", "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
-                         json={"to": LINE_USER_ID, "messages": [{"type": "text", "text": message}]}, timeout=10)
-        except Exception:
-            pass
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        try:
-            session.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                         json={"chat_id": TELEGRAM_CHAT_ID, "text": message}, timeout=10)
+                         json={"to": LINE_USER_ID, "messages": [{"type": "text", "text": message[:4500]}]}, timeout=10)
         except Exception:
             pass
 
@@ -73,8 +67,7 @@ def get_active_stadiums(date_str: str):
                 if jcd not in stadiums and 1 <= jcd <= 24:
                     stadiums.append(jcd)
         return sorted(stadiums)
-    except Exception as e:
-        print(f"開催場取得エラー: {e}")
+    except Exception:
         return []
 
 
@@ -84,42 +77,31 @@ def analyze_single_race(args):
     list_url = f"https://www.boatrace.jp/owpc/pc/race/racelist?rno={rno}&jcd={jcd:02d}&hd={date_str}"
 
     try:
-        # 1. 結果ページから着順を取得
+        # 1. 結果取得（着順テーブルから1〜3着を直接抽出）
         res = session.get(result_url, timeout=8)
         res.encoding = res.apparent_encoding
         soup = BeautifulSoup(res.text, "html.parser")
 
-        # 結果テーブル（1着〜3着の艇番）を直接抽出
-        ranks = []
-        for tbody in soup.find_all("tbody", class_="is-p10-0"):
-            txt = tbody.get_text(" ", strip=True)
-            # 着順の艇番を抽出
-            m = re.search(r"^([1-6])\b", txt)
-            if m:
-                ranks.append(int(m.group(1)))
-            if len(ranks) == 3:
-                break
+        ranks = {}
+        for tr in soup.find_all("tr"):
+            tds = tr.find_all("td")
+            if len(tds) >= 2:
+                r_txt = tds[0].get_text(strip=True).translate(str.maketrans("１２３４５６", "123456"))
+                b_txt = tds[1].get_text(strip=True).translate(str.maketrans("１２３４５６", "123456"))
+                if r_txt in ["1", "2", "3"] and b_txt in ["1", "2", "3", "4", "5", "6"]:
+                    ranks[int(r_txt)] = int(b_txt)
 
-        # 代替判定：払戻枠から3連単を取得
-        if len(ranks) < 3:
-            for td in soup.find_all("td", class_="is-p10-0"):
-                t = td.get_text(strip=True)
-                digits = re.findall(r"[1-6]", t)
-                if len(digits) >= 3:
-                    ranks = [int(d) for d in digits[:3]]
-                    break
-
-        if len(ranks) < 3:
+        if not (1 in ranks and 2 in ranks and 3 in ranks):
             return None
 
-        first, second, third = ranks[0], ranks[1], ranks[2]
+        first, second, third = ranks[1], ranks[2], ranks[3]
         combo = f"{first}-{second}-{third}"
 
-        # 1-234-234 の判定 (1着が1、2着と3着が2〜4のいずれか)
+        # 1-234-234 の判定
         if not (first == 1 and second in [2, 3, 4] and third in [2, 3, 4] and second != third):
             return None
 
-        # 2. 出走表から各選手のスペックを取得
+        # 2. 出走表からスペック（勝率）を取得
         res_l = session.get(list_url, timeout=8)
         res_l.encoding = res_l.apparent_encoding
         soup_l = BeautifulSoup(res_l.text, "html.parser")
@@ -128,27 +110,21 @@ def analyze_single_race(args):
         if not table:
             return None
 
+        tbodies = table.find_all("tbody")
+        if len(tbodies) < 6:
+            return None
+
         racers = []
-        for pit, tb in enumerate(table.find_all("tbody")[:6], 1):
+        for pit, tb in enumerate(tbodies[:6], 1):
             txt = tb.get_text(" ", strip=True)
             rm = re.search(r"\b(A1|A2|B1|B2)\b", txt)
             rank = rm.group(1) if rm else "B1"
 
-            # 全国勝率の抽出
-            win_val = 0.0
-            for td in tb.find_all("td"):
-                lines = [l.strip() for l in td.get_text("\n", strip=True).split("\n") if l.strip()]
-                for line in lines:
-                    if re.match(r"^[1-9]\.\d{2}$", line):
-                        win_val = float(line)
-                        break
-                if win_val > 0.0:
-                    break
+            # 全国勝率の取得
+            win_rates = re.findall(r"\b([1-9]\.\d{2})\b", txt)
+            win_val = float(win_rates[0]) if win_rates else 0.0
 
             racers.append({"pit": pit, "rank": rank, "win": win_val})
-
-        if len(racers) < 6:
-            return None
 
         r1 = racers[0]
         r2 = racers[1]
@@ -175,54 +151,44 @@ def analyze_single_race(args):
 
 def main():
     date_str = "20261109"
-    print(f"=== {date_str} 全レース生データ解析開始 ===")
+    print(f"=== {date_str} 生データ解析 ===")
 
     stadiums = get_active_stadiums(date_str)
-    print(f"開催場: {len(stadiums)}場")
-
     tasks = [(jcd, rno, date_str) for jcd in stadiums for rno in range(1, 13)]
 
     with ThreadPoolExecutor(max_workers=10) as executor:
         results = [r for r in executor.map(analyze_single_race, tasks) if r is not None]
 
-    print(f"\n【解析結果】1-234-234 決着数: {len(results)} 件\n")
+    print(f"検出件数: {len(results)}件")
 
     if not results:
-        send_notification(f"【生データ解析】{date_str} の対象レース抽出に失敗しました。")
+        send_notification(f"【生データ解析】{date_str} の1-234-234該当なし")
         return
 
-    # 集計計算
-    avg_r1_win = sum(r["r1_win"] for r in results) / len(results)
-    avg_diff = sum(r["diff"] for r in results) / len(results)
-    avg_outer = sum(r["max_outer"] for r in results) / len(results)
+    avg_r1_win = sum(r["r1_win"] for r in results if r["r1_win"] > 0) / max(len(results), 1)
+    avg_diff = sum(r["diff"] for r in results) / max(len(results), 1)
+    avg_outer = sum(r["max_outer"] for r in results if r["max_outer"] > 0) / max(len(results), 1)
     a1_count = sum(1 for r in results if r["r1_rank"] == "A1")
 
-    lines = [f"📊【11/9 生データ分析（実決着: {len(results)}件）】📊\n"]
-    for r in results[:10]:  # LINE文字数制限のため上位10件を表示
+    lines = [f"📊【11/9 生データ実測（計{len(results)}件）】📊\n"]
+    for r in results[:8]:
         lines.append(
-            f"📍 {r['stadium']}{r['rno']}R [{r['combo']}]\n"
-            f" 1号艇:{r['r1_rank']}(勝率{r['r1_win']:.2f}) | 2号艇差:{r['diff']:+.2f}\n"
-            f" 外枠:{r['r5_rank']}/{r['r6_rank']}(最高勝率{r['max_outer']:.2f})"
+            f"📍 {r['stadium']} {r['rno']}R [{r['combo']}]\n"
+            f"・1号艇: {r['r1_rank']} (勝率{r['r1_win']:.2f}) | 2号艇差:{r['diff']:+.2f}\n"
+            f"・5-6号艇: 最高勝率 {r['max_outer']:.2f} ({r['r5_rank']}/{r['r6_rank']})"
         )
 
-    if len(results) > 10:
-        lines.append(f"\n...他 {len(results) - 10} 件")
-
-    summary = (
+    lines.append(
         f"\n━━━━━━━━━━━━━━━\n"
-        f"【実データから判明した平均値】\n"
-        f"・1号艇 A1率: {a1_count}/{len(results)}件 ({a1_count/len(results)*100:.1f}%)\n"
+        f"【実測から逆算した平均値】\n"
+        f"・1号艇 A1率: {a1_count}/{len(results)} ({a1_count/len(results)*100:.0f}%)\n"
         f"・1号艇 平均勝率: {avg_r1_win:.2f}\n"
         f"・2号艇との平均差: {avg_diff:+.2f}\n"
-        f"・外枠の平均勝率: {avg_outer:.2f}\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"※この実測値と一般統計を比較します。"
+        f"・5-6号艇の平均勝率: {avg_outer:.2f}"
     )
-    lines.append(summary)
 
     send_notification("\n".join(lines))
-    print("\n".join(lines))
-    print("[完了] LINE送信成功")
+    print("LINE送信完了")
 
 
 if __name__ == "__main__":
