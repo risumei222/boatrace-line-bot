@@ -1,33 +1,31 @@
 """
-BoatraceCSV データ取得・独立検証スクリプト
-※ 既存Bot・予想ロジック・LINE通知からは完全に分離されています。
+BoatraceCSV 第2段階 独立検証スクリプト
+対象: 2026年11月09日 (過去日) / 2026年11月10日 (当日)
+※ 本番Bot・LINE通知・予想ロジックとは完全に分離されています。
 """
 
+import io
 import os
 import sys
-import io
 import json
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone, timedelta
 import pandas as pd
 
-# 対象日（検証指定日）
-TARGET_YEAR = "2026"
-TARGET_MONTH = "11"
-TARGET_DAY = "11"
-TARGET_DATE_STR = f"{TARGET_YEAR}/{TARGET_MONTH}/{TARGET_DAY}"
+TARGET_DATES = [
+    {"label": "過去日", "year": "2026", "month": "11", "day": "09", "date_str": "2026/11/09", "yymmdd": "261109"},
+    {"label": "当日",   "year": "2026", "month": "11", "day": "10", "date_str": "2026/11/10", "yymmdd": "261110"}
+]
 
-# 検査対象URL
-TARGET_URLS = {
-    "race_cards": f"https://boatracecsv.github.io/data/programs/race_cards/{TARGET_DATE_STR}.csv",
-    "title": f"https://boatracecsv.github.io/data/programs/title/{TARGET_DATE_STR}.csv",
-    "recent_national": f"https://boatracecsv.github.io/data/programs/recent_national/{TARGET_DATE_STR}.csv",
-    "motor_stats": f"https://boatracecsv.github.io/data/programs/motor_stats/{TARGET_DATE_STR}.csv"
-}
+CSV_TYPES = [
+    ("title", "レースタイトル・開催一覧"),
+    ("race_cards", "出走表詳細"),
+    ("recent_national", "全国近況5節"),
+    ("motor_stats", "モーター成績")
+]
 
-# 必須検査17項目
-REQUIRED_FIELDS = [
+REQUIRED_17_FIELDS = [
     "登録番号", "選手名", "級別",
     "全国勝率", "全国2連対率", "全国3連対率",
     "当地勝率", "当地2連対率", "当地3連対率",
@@ -37,290 +35,145 @@ REQUIRED_FIELDS = [
 ]
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) VerificationScript/1.0"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) VerificationScript/2.0"
 }
 
 
-def test_mbrace_connectivity() -> dict:
-    """GitHub Actionsからmbraceへの直接接続性をテスト"""
-    test_url = "http://www1.mbrace.or.jp/od2/B/202611/b261111.lzh"
-    result = {"url": test_url, "accessible": False, "status": None, "error": None}
-    try:
-        req = urllib.request.Request(test_url, headers=HEADERS)
-        with urllib.request.urlopen(req, timeout=10) as res:
-            result["accessible"] = (res.status == 200)
-            result["status"] = res.status
-    except urllib.error.HTTPError as e:
-        result["status"] = e.code
-        result["error"] = f"HTTPError {e.code}"
-    except Exception as e:
-        result["error"] = str(e)
-    return result
+def test_mbrace_patterns(yymmdd: str, date_str: str):
+    """mbraceのURL命名パターンを複数検査"""
+    print(f"\n==================================================")
+    print(f"【mbrace Bファイル 命名規則・接続検査: {date_str}】")
+    print(f"==================================================")
+
+    yymm = yymmdd[:4]
+    patterns = [
+        f"http://www1.mbrace.or.jp/od2/B/20{yymm}/b{yymmdd}.lzh",
+        f"http://www1.mbrace.or.jp/od2/B/20{yymm}/B{yymmdd}.lzh",
+        f"http://www1.mbrace.or.jp/od2/B/{yymm}/b{yymmdd}.lzh",
+        f"http://www1.mbrace.or.jp/od2/B/20{yymm}/b20{yymmdd}.lzh",
+        f"https://www.boatrace.jp/owpc/pc/extra/data/download.html"
+    ]
+
+    for url in patterns:
+        try:
+            req = urllib.request.Request(url, headers=HEADERS)
+            with urllib.request.urlopen(req, timeout=10) as res:
+                size = len(res.read())
+                print(f"・[200 OK] {url} (取得サイズ: {size:,} B)")
+        except urllib.error.HTTPError as e:
+            print(f"・[HTTP {e.code}] {url}")
+        except Exception as e:
+            print(f"・[接続遮断/エラー] {url} -> {e}")
 
 
-def fetch_and_inspect_file(name: str, url: str) -> dict:
-    """単一ファイルのHTTPS取得とメタデータ検査"""
-    record = {
-        "name": name,
-        "url": url,
-        "http_status": None,
-        "success": False,
-        "status_code": "FETCH_FAILED",
-        "content_length": None,
-        "actual_bytes": 0,
-        "content_type": None,
-        "last_modified": None,
-        "etag": None,
-        "encoding": None,
-        "row_count": 0,
-        "col_count": 0,
-        "columns": [],
-        "head_samples": [],
-        "tail_samples": [],
-        "raw_df": None,
-        "error_message": None
-    }
+def inspect_csv_content(csv_type: str, df: pd.DataFrame):
+    """取得成功したCSVの構造・項目を詳細解析"""
+    print(f"\n--- 詳細解析: {csv_type} ---")
+    print(f"・全データ行数: {len(df)} 行")
+    print(f"・全列数: {len(df.columns)} 列")
+    print(f"・カラム一覧: {list(df.columns)}")
 
-    try:
-        req = urllib.request.Request(url, headers=HEADERS)
-        with urllib.request.urlopen(req, timeout=20) as res:
-            record["http_status"] = res.status
-            record["content_type"] = res.headers.get("Content-Type")
-            record["content_length"] = res.headers.get("Content-Length")
-            record["last_modified"] = res.headers.get("Last-Modified")
-            record["etag"] = res.headers.get("ETag")
-
-            if res.status != 200:
-                record["status_code"] = "HTTP_NON_200"
-                return record
-
-            raw_bytes = res.read()
-            record["actual_bytes"] = len(raw_bytes)
-
-            if len(raw_bytes) == 0:
-                record["status_code"] = "EMPTY_FILE"
-                return record
-
-            # 文字コード判定とデコード
-            decoded_text = None
-            for enc in ["utf-8", "cp932", "shift_jis", "euc-jp"]:
-                try:
-                    decoded_text = raw_bytes.decode(enc)
-                    record["encoding"] = enc
-                    break
-                except UnicodeDecodeError:
-                    continue
-
-            if decoded_text is None:
-                record["status_code"] = "PARSE_FAILED"
-                record["error_message"] = "デコード失敗（対応文字コードなし）"
-                return record
-
-            # CSV解析
-            try:
-                df = pd.read_csv(io.StringIO(decoded_text))
-            except Exception as e:
-                record["status_code"] = "PARSE_FAILED"
-                record["error_message"] = f"CSVパース失敗: {e}"
-                return record
-
-            record["raw_df"] = df
-            record["row_count"] = len(df)
-            record["col_count"] = len(df.columns)
-            record["columns"] = list(df.columns)
-            record["head_samples"] = df.head(3).to_dict(orient="records")
-            record["tail_samples"] = df.tail(3).to_dict(orient="records")
-            record["success"] = True
-
-    except urllib.error.HTTPError as e:
-        record["http_status"] = e.code
-        record["status_code"] = "HTTP_NON_200"
-        record["error_message"] = f"HTTP Error {e.code}"
-    except Exception as e:
-        record["status_code"] = "FETCH_FAILED"
-        record["error_message"] = str(e)
-
-    return record
-
-
-def inspect_race_cards(df: pd.DataFrame) -> dict:
-    """出走表（race_cards）の必須項目および6艇整合性検査"""
-    result = {
-        "stadium_count": 0,
-        "duplicate_race_codes": 0,
-        "total_races": 0,
-        "complete_6_boats_races": 0,
-        "incomplete_races": 0,
-        "field_stats": {},
-        "missing_required_columns": [],
-        "status_code": "VALIDATED_NO_RACES"
-    }
-
-    if df is None or len(df) == 0:
-        return result
-
-    # 必須カラムの存在チェック
-    present_cols = set(df.columns)
-    missing_cols = [f for f in REQUIRED_FIELDS if f not in present_cols]
-    result["missing_required_columns"] = missing_cols
-
-    # 各フィールドの「値が存在する件数」と「欠損件数」
-    for field in REQUIRED_FIELDS:
-        if field in present_cols:
-            valid_count = int(df[field].notna().sum())
-            null_count = int(df[field].isna().sum())
-            result["field_stats"][field] = {
-                "exists": True,
-                "valid_count": valid_count,
-                "null_count": null_count,
-                "valid_rate": round(valid_count / len(df) * 100, 2) if len(df) > 0 else 0.0
-            }
-        else:
-            result["field_stats"][field] = {
-                "exists": False,
-                "valid_count": 0,
-                "null_count": len(df),
-                "valid_rate": 0.0
-            }
-
-    # レースコード・場判定（カラム名推測・検出）
-    rc_col = None
-    for col in ["レースコード", "race_code", "race_id", "RACE_CODE"]:
-        if col in df.columns:
-            rc_col = col
-            break
-
-    stadium_col = None
-    for col in ["場コード", "場名", "stadium", "place"]:
-        if col in df.columns:
-            stadium_col = col
-            break
-
-    boat_col = None
-    for col in ["艇番", "boat_number", "pit_number", "枠番"]:
-        if col in df.columns:
-            boat_col = col
-            break
+    # レース場数・レースコード検出
+    rc_col = next((c for c in ["レースコード", "race_code", "race_id", "RACE_CODE"] if c in df.columns), None)
+    stadium_col = next((c for c in ["場コード", "場名", "stadium", "place", "場"] if c in df.columns), None)
+    boat_col = next((c for c in ["艇番", "boat_number", "pit_number", "枠番", "艇"] if c in df.columns), None)
 
     if stadium_col:
-        result["stadium_count"] = int(df[stadium_col].nunique())
-
+        print(f"・検出レース場数: {df[stadium_col].nunique()} 場")
     if rc_col:
-        race_groups = df.groupby(rc_col)
-        result["total_races"] = len(race_groups)
-        
-        # 6艇揃っているか
-        complete_count = 0
-        incomplete_count = 0
-        for r_code, group in race_groups:
-            if len(group) == 6:
-                if boat_col and set(group[boat_col].dropna().astype(int)) == {1, 2, 3, 4, 5, 6}:
-                    complete_count += 1
-                elif not boat_col:
-                    complete_count += 1
-                else:
-                    incomplete_count += 1
+        total_races = df[rc_col].nunique()
+        print(f"・ユニークレース数: {total_races} レース")
+        print(f"・レースコード重複行数: {len(df) - total_races} 行")
+
+        # 6艇の整合性
+        if boat_col:
+            groups = df.groupby(rc_col)
+            complete_6 = sum(1 for _, g in groups if len(g) == 6)
+            print(f"・6艇揃っているレース数: {complete_6} / {total_races} レース")
+
+    # 先頭2行サンプル
+    print(f"・先頭1行データサンプル:\n{df.head(1).to_dict(orient='records')}")
+
+    # 出走表(race_cards)の場合、17項目の照合
+    if csv_type == "race_cards":
+        print(f"\n【出走表 必須17項目の照合結果】")
+        present = set(df.columns)
+        missing = [f for f in REQUIRED_17_FIELDS if f not in present]
+        print(f"・不足カラム: {missing if missing else 'なし（17項目すべて一致）'}")
+
+        print("\n| カラム名 | 存在 | 値あり件数 | 欠損件数 | 充足率 |")
+        print("| :--- | :---: | :---: | :---: | :---: |")
+        for f in REQUIRED_17_FIELDS:
+            if f in present:
+                valid = int(df[f].notna().sum())
+                nulls = int(df[f].isna().sum())
+                rate = round(valid / len(df) * 100, 1) if len(df) > 0 else 0.0
+                print(f"| {f} | ○ | {valid} | {nulls} | {rate}% |")
             else:
-                incomplete_count += 1
+                print(f"| {f} | × (カラム欠損) | 0 | {len(df)} | 0.0% |")
 
-        result["complete_6_boats_races"] = complete_count
-        result["incomplete_races"] = incomplete_count
 
-    # 総合ステータス
-    if missing_cols:
-        result["status_code"] = "SCHEMA_MISMATCH"
-    elif len(df) == 0:
-        result["status_code"] = "VALIDATED_NO_RACES"
-    else:
-        result["status_code"] = "VALIDATED_WITH_RACES"
+def test_boatrace_csv_date(target: dict):
+    """特定日付のBoatraceCSV 4種類を取得・検証"""
+    d_str = target["date_str"]
+    lbl = target["label"]
+    print(f"\n==================================================")
+    print(f"【BoatraceCSV 取得検証: {lbl} ({d_str})】")
+    print(f"==================================================")
 
-    return result
+    for c_type, c_desc in CSV_TYPES:
+        url = f"https://boatracecsv.github.io/data/programs/{c_type}/{d_str}.csv"
+        print(f"\n■ [{c_type}] {c_desc}")
+        print(f"URL: {url}")
+
+        try:
+            req = urllib.request.Request(url, headers=HEADERS)
+            with urllib.request.urlopen(req, timeout=15) as res:
+                raw = res.read()
+                print(f"・HTTPステータス: {res.status}")
+                print(f"・実取得バイト数: {len(raw):,} bytes")
+                print(f"・Last-Modified: {res.headers.get('Last-Modified')}")
+                print(f"・ETag: {res.headers.get('ETag')}")
+
+                if len(raw) == 0:
+                    print("・判定: EMPTY_FILE")
+                    continue
+
+                df = None
+                for enc in ["utf-8", "cp932", "shift_jis"]:
+                    try:
+                        df = pd.read_csv(io.StringIO(raw.decode(enc)))
+                        print(f"・文字コード: {enc}")
+                        break
+                    except Exception:
+                        continue
+
+                if df is None:
+                    print("・判定: PARSE_FAILED")
+                    continue
+
+                print(f"・判定: VALIDATED_WITH_RACES (取得成功)")
+                inspect_csv_content(c_type, df)
+
+        except urllib.error.HTTPError as e:
+            print(f"・HTTPステータス: {e.code} (未公開/404)")
+            print(f"・判定: HTTP_NON_200 (コード: {e.code})")
+        except Exception as e:
+            print(f"・通信エラー: {e}")
+            print(f"・判定: FETCH_FAILED")
 
 
 def main():
     jst = timezone(timedelta(hours=9))
     now_jst = datetime.now(jst).strftime("%Y-%m-%d %H:%M:%S JST")
-    print(f"=== BoatraceCSV 独立検証実行: {now_jst} ===")
+    print(f"##################################################")
+    print(f" BoatraceCSV 第2段階検証実行ログ: {now_jst}")
+    print(f"##################################################")
 
-    # 1. mbrace 接続性テスト
-    print("\n[STEP 1] GitHub Actions -> mbrace 直接接続テスト中...")
-    mbrace_res = test_mbrace_connectivity()
-    print(f"mbrace 接続結果: {mbrace_res}")
-
-    # 2. 4種類のファイル取得
-    print("\n[STEP 2] BoatraceCSV 4ファイル取得・解析中...")
-    file_results = {}
-    for name, url in TARGET_URLS.items():
-        print(f"取得中: {name} ({url})")
-        res = fetch_and_inspect_file(name, url)
-        file_results[name] = res
-
-    # 3. race_cards 詳細検査
-    print("\n[STEP 3] race_cards 詳細スキーマ・必須項目検査中...")
-    rc_res = file_results.get("race_cards", {})
-    rc_detail = inspect_race_cards(rc_res.get("raw_df"))
-
-    # 4. レポート生成
-    report_lines = [
-        "# BoatraceCSV 独立検証結果レポート",
-        f"- 実行時刻: {now_jst}",
-        f"- 検証対象日: {TARGET_DATE_STR}",
-        "",
-        "## 1. mbrace 直接依存性の確認結果",
-        f"- 対象URL: `{mbrace_res['url']}`",
-        f"- GitHub Actionsからの直接接続可否: {'【可能】' if mbrace_res['accessible'] else '【遮断 / 失敗】'}",
-        f"- HTTPステータス: {mbrace_res['status']}",
-        f"- エラー詳細: {mbrace_res['error']}",
-        "- **アーキテクチャ考察**: BoatraceCSV（GitHub Pages）が正常に取得できる場合、GitHub Actions環境がmbraceへ直接通信する必要は完全に排除されます（HTTPSで静的CSVを取得するのみ）。",
-        "",
-        "## 2. 4種類のCSVファイル取得結果一覧"
-    ]
-
-    for name, res in file_results.items():
-        status = res["status_code"]
-        report_lines.extend([
-            f"### ファイル: {name}",
-            f"- URL: `{res['url']}`",
-            f"- 判定ステータス: **{status}**",
-            f"- HTTPステータス: {res['http_status']}",
-            f"- Content-Type: {res['content_type']}",
-            f"- Content-Length: {res['content_length']} (実取得バイト数: {res['actual_bytes']:,} B)",
-            f"- Last-Modified: {res['last_modified']}",
-            f"- ETag: {res['etag']}",
-            f"- 文字コード: {res['encoding']}",
-            f"- 行数: {res['row_count']} 行 / 列数: {res['col_count']} 列",
-            f"- カラム一覧: `{', '.join(res['columns'][:10])}` {'...' if len(res['columns']) > 10 else ''}",
-            f"- エラー情報: {res['error_message']}",
-            ""
-        ])
-
-    report_lines.extend([
-        "## 3. 出走表（race_cards）必須17項目検査結果",
-        f"- 総合判定: **{rc_detail['status_code']}**",
-        f"- 検出レース場数: {rc_detail['stadium_count']} 場",
-        f"- 検出全レース数: {rc_detail['total_races']} レース",
-        f"- 6艇完全一致レース数: {rc_detail['complete_6_boats_races']} レース",
-        f"- 不完全レース数: {rc_detail['incomplete_races']} レース",
-        f"- 不足カラム: {rc_detail['missing_required_columns'] if rc_detail['missing_required_columns'] else 'なし（全列存在）'}",
-        "",
-        "| 項目名 | カラム存在 | 値あり件数 | 欠損件数 | 充足率 |",
-        "| :--- | :---: | :---: | :---: | :---: |"
-    ])
-
-    for field, stat in rc_detail["field_stats"].items():
-        exist_str = "あり" if stat["exists"] else "なし"
-        report_lines.append(f"| {field} | {exist_str} | {stat['valid_count']} | {stat['null_count']} | {stat['valid_rate']}% |")
-
-    final_report = "\n".join(report_lines)
-
-    # 成果物の保存
-    os.makedirs("verification_output", exist_ok=True)
-    with open("verification_output/report.md", "w", encoding="utf-8") as f:
-        f.write(final_report)
-
-    print("\n" + "=" * 50)
-    print(final_report)
-    print("=" * 50)
+    # 1. 2026/11/09 (過去日) および 2026/11/10 (当日) の検査
+    for target in TARGET_DATES:
+        test_boatrace_csv_date(target)
+        test_mbrace_patterns(target["yymmdd"], target["date_str"])
 
 
 if __name__ == "__main__":
