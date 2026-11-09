@@ -57,7 +57,6 @@ def get_active_stadiums(date_str: str):
     url = f"https://www.boatrace.jp/owpc/pc/race/index?hd={date_str}"
     try:
         res = session.get(url, timeout=10)
-        res.encoding = res.apparent_encoding
         soup = BeautifulSoup(res.text, "html.parser")
         stadiums = []
         for a in soup.find_all("a", href=re.compile(r"jcd=\d+")):
@@ -77,53 +76,50 @@ def analyze_single_race(args):
     list_url = f"https://www.boatrace.jp/owpc/pc/race/racelist?rno={rno}&jcd={jcd:02d}&hd={date_str}"
 
     try:
-        # 1. 結果取得（着順テーブルから1〜3着を直接抽出）
+        # 1. 結果取得（タグ構造に依存せず、テキスト全体から3連単の着順を抽出）
         res = session.get(result_url, timeout=8)
-        res.encoding = res.apparent_encoding
-        soup = BeautifulSoup(res.text, "html.parser")
-
-        ranks = {}
-        for tr in soup.find_all("tr"):
-            tds = tr.find_all("td")
-            if len(tds) >= 2:
-                r_txt = tds[0].get_text(strip=True).translate(str.maketrans("１２３４５６", "123456"))
-                b_txt = tds[1].get_text(strip=True).translate(str.maketrans("１２３４５６", "123456"))
-                if r_txt in ["1", "2", "3"] and b_txt in ["1", "2", "3", "4", "5", "6"]:
-                    ranks[int(r_txt)] = int(b_txt)
-
-        if not (1 in ranks and 2 in ranks and 3 in ranks):
+        text_clean = res.text.translate(str.maketrans("１２３４５６", "123456"))
+        
+        # 「3連単」の文字以降から数字3つを抽出
+        m_section = re.search(r"3連単.*?(?=3連複|2連単|2連複|拡連複|単勝|複勝|$)", text_clean, re.DOTALL)
+        if not m_section:
+            return None
+        
+        digits = re.findall(r"\b([1-6])\b", m_section.group(0))
+        if len(digits) < 3:
             return None
 
-        first, second, third = ranks[1], ranks[2], ranks[3]
+        first, second, third = int(digits[0]), int(digits[1]), int(digits[2])
         combo = f"{first}-{second}-{third}"
 
-        # 1-234-234 の判定
+        # 1-234-234 判定
         if not (first == 1 and second in [2, 3, 4] and third in [2, 3, 4] and second != third):
             return None
 
-        # 2. 出走表からスペック（勝率）を取得
-        res_l = session.get(list_url, timeout=8)
-        res_l.encoding = res_l.apparent_encoding
-        soup_l = BeautifulSoup(res_l.text, "html.parser")
+        # 払戻金の抽出
+        m_pay = re.search(r"[¥￥]([0-9,]+)", m_section.group(0))
+        payout = m_pay.group(1) if m_pay else "-"
 
+        # 2. 出走表からスペックを取得
+        res_l = session.get(list_url, timeout=8)
+        soup_l = BeautifulSoup(res_l.text, "html.parser")
         table = soup_l.find("table", class_="is-w748") or soup_l.find("div", class_="table1").find("table")
         if not table:
             return None
 
-        tbodies = table.find_all("tbody")
+        tbodies = table.find_all("tbody")[:6]
         if len(tbodies) < 6:
             return None
 
         racers = []
-        for pit, tb in enumerate(tbodies[:6], 1):
+        for pit, tb in enumerate(tbodies, 1):
             txt = tb.get_text(" ", strip=True)
             rm = re.search(r"\b(A1|A2|B1|B2)\b", txt)
             rank = rm.group(1) if rm else "B1"
 
-            # 全国勝率の取得
-            win_rates = re.findall(r"\b([1-9]\.\d{2})\b", txt)
-            win_val = float(win_rates[0]) if win_rates else 0.0
-
+            # 勝率の抽出
+            rates = re.findall(r"\b([1-9]\.\d{2})\b", txt)
+            win_val = float(rates[0]) if rates else 0.0
             racers.append({"pit": pit, "rank": rank, "win": win_val})
 
         r1 = racers[0]
@@ -138,6 +134,7 @@ def analyze_single_race(args):
             "stadium": JCD_NAME_MAP.get(jcd, f"{jcd}場"),
             "rno": rno,
             "combo": combo,
+            "payout": payout,
             "r1_rank": r1["rank"],
             "r1_win": r1["win"],
             "diff": diff,
@@ -165,17 +162,20 @@ def main():
         send_notification(f"【生データ解析】{date_str} の1-234-234該当なし")
         return
 
-    avg_r1_win = sum(r["r1_win"] for r in results if r["r1_win"] > 0) / max(len(results), 1)
-    avg_diff = sum(r["diff"] for r in results) / max(len(results), 1)
-    avg_outer = sum(r["max_outer"] for r in results if r["max_outer"] > 0) / max(len(results), 1)
+    # 実測データの集計
+    valid_r1 = [r["r1_win"] for r in results if r["r1_win"] > 0]
+    avg_r1_win = sum(valid_r1) / len(valid_r1) if valid_r1 else 0.0
+    avg_diff = sum(r["diff"] for r in results) / len(results)
+    valid_outer = [r["max_outer"] for r in results if r["max_outer"] > 0]
+    avg_outer = sum(valid_outer) / len(valid_outer) if valid_outer else 0.0
     a1_count = sum(1 for r in results if r["r1_rank"] == "A1")
 
-    lines = [f"📊【11/9 生データ実測（計{len(results)}件）】📊\n"]
+    lines = [f"📊【11/9 生データ実測（実決着: {len(results)}件）】📊\n"]
     for r in results[:8]:
         lines.append(
-            f"📍 {r['stadium']} {r['rno']}R [{r['combo']}]\n"
+            f"📍 {r['stadium']}{r['rno']}R [{r['combo']}] ({r['payout']}円)\n"
             f"・1号艇: {r['r1_rank']} (勝率{r['r1_win']:.2f}) | 2号艇差:{r['diff']:+.2f}\n"
-            f"・5-6号艇: 最高勝率 {r['max_outer']:.2f} ({r['r5_rank']}/{r['r6_rank']})"
+            f"・外枠: {r['r5_rank']}/{r['r6_rank']} (最高勝率{r['max_outer']:.2f})"
         )
 
     lines.append(
@@ -184,7 +184,9 @@ def main():
         f"・1号艇 A1率: {a1_count}/{len(results)} ({a1_count/len(results)*100:.0f}%)\n"
         f"・1号艇 平均勝率: {avg_r1_win:.2f}\n"
         f"・2号艇との平均差: {avg_diff:+.2f}\n"
-        f"・5-6号艇の平均勝率: {avg_outer:.2f}"
+        f"・外枠の平均勝率: {avg_outer:.2f}\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"※この実データをもとに、最も的中率と回収率が高くなるフィルターの数値を固めます。"
     )
 
     send_notification("\n".join(lines))
