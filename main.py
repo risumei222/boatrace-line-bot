@@ -1,66 +1,81 @@
 import os
-import sys
-import subprocess
-import requests
+import json
+import urllib.request
+import urllib.error
 
 LINE_NOTIFY_TOKEN = os.getenv("LINE_NOTIFY_TOKEN")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_USER_ID = os.getenv("LINE_USER_ID")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-}
 
 
-def send_notification(message: str):
+def send_line(text: str):
+    # LINE Notify
     if LINE_NOTIFY_TOKEN:
         try:
-            requests.post("https://notify-api.line.me/api/notify",
-                          headers={"Authorization": f"Bearer {LINE_NOTIFY_TOKEN}"},
-                          data={"message": f"\n{message}"}, timeout=10)
+            req = urllib.request.Request(
+                "https://notify-api.line.me/api/notify",
+                data=urllib.parse.urlencode({"message": f"\n{text}"}).encode("utf-8"),
+                headers={"Authorization": f"Bearer {LINE_NOTIFY_TOKEN}"}
+            )
+            urllib.request.urlopen(req, timeout=10)
         except Exception:
             pass
+
+    # LINE Messaging API
     if LINE_CHANNEL_ACCESS_TOKEN and LINE_USER_ID:
         try:
-            requests.post("https://api.line.me/v2/bot/message/push",
-                          headers={"Content-Type": "application/json", "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
-                          json={"to": LINE_USER_ID, "messages": [{"type": "text", "text": message[:4500]}]}, timeout=10)
+            payload = json.dumps({
+                "to": LINE_USER_ID,
+                "messages": [{"type": "text", "text": text[:4000]}]
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                "https://api.line.me/v2/bot/message/push",
+                data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"
+                }
+            )
+            urllib.request.urlopen(req, timeout=10)
         except Exception:
             pass
 
 
 def main():
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     lines = ["📡【公式データファイル 通信テスト結果】"]
 
-    # テスト対象1: 公式結果テキストアーカイブ（mbrace サーバー）
-    # 2026年11月9日の結果ファイル: k261109.lzh
-    url_mbrace = "http://www1.mbrace.or.jp/od2/K/202611/k261109.lzh"
+    # ① データ配信サーバー（mbrace）
+    url1 = "http://www1.mbrace.or.jp/od2/K/202611/k261109.lzh"
     try:
-        r1 = requests.get(url_mbrace, headers=HEADERS, timeout=10)
-        lines.append(f"\n① データ配信サーバー (mbrace):")
-        lines.append(f"・HTTPステータス: {r1.status_code}")
-        lines.append(f"・取得サイズ: {len(r1.content)} バイト")
-        if r1.status_code == 200:
+        req1 = urllib.request.Request(url1, headers=headers)
+        with urllib.request.urlopen(req1, timeout=10) as res1:
+            data = res1.read()
+            lines.append("\n① データ配信サーバー (mbrace):")
+            lines.append(f"・HTTPステータス: {res1.status}")
+            lines.append(f"・取得サイズ: {len(data)} バイト")
             lines.append("➔ 【成功】ブロックされずに取得可能！")
-        else:
-            lines.append(f"➔ 【失敗】アクセス制限または存在せず")
+    except urllib.error.HTTPError as e:
+        lines.append("\n① データ配信サーバー (mbrace):")
+        lines.append(f"・HTTPエラー: {e.code}")
     except Exception as e:
-        lines.append(f"\n① データ配信サーバー エラー:\n{e}")
+        lines.append(f"\n① 接続エラー: {e}")
 
-    # テスト対象2: BOAT RACE公式ダウンロード窓口
-    url_official = "https://www.boatrace.jp/owpc/pc/extra/data/download.html"
+    # ② 公式サイト ダウンロードページ
+    url2 = "https://www.boatrace.jp/owpc/pc/extra/data/download.html"
     try:
-        r2 = requests.get(url_official, headers=HEADERS, timeout=10)
-        lines.append(f"\n② 公式ダウンロード窓口:")
-        lines.append(f"・HTTPステータス: {r2.status_code}")
+        req2 = urllib.request.Request(url2, headers=headers)
+        with urllib.request.urlopen(req2, timeout=10) as res2:
+            lines.append("\n② 公式ダウンロード窓口:")
+            lines.append(f"・HTTPステータス: {res2.status}")
+    except urllib.error.HTTPError as e:
+        lines.append(f"\n② 公式ダウンロード窓口 HTTPエラー: {e.code}")
     except Exception as e:
-        lines.append(f"\n② 公式窓口 エラー:\n{e}")
+        lines.append(f"\n② 接続エラー: {e}")
 
     report = "\n".join(lines)
     print(report)
-    send_notification(report)
+    send_line(report)
 
 
 if __name__ == "__main__":
