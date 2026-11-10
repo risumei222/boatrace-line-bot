@@ -1,0 +1,116 @@
+name: run-normalizer
+on:
+  workflow_dispatch:
+
+jobs:
+  test_and_normalize:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Create Normalizer and Run
+        run: |
+          python3 - << 'EOF'
+          import urllib.request
+          import csv
+          import io
+          import json
+          import hashlib
+          import re
+          import os
+
+          os.makedirs("raw", exist_ok=True)
+          os.makedirs("audit", exist_ok=True)
+          os.makedirs("normalized", exist_ok=True)
+
+          urls = {
+              "title": "https://boatracecsv.github.io/data/programs/title/2026/11/11.csv",
+              "cards": "https://boatracecsv.github.io/data/programs/race_cards/2026/11/11.csv"
+          }
+
+          raw = {}
+          for key, url in urls.items():
+              req = urllib.request.Request(url, headers={"User-Agent": "Normalizer-Test"})
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  raw[key] = resp.read()
+              with open(f"raw/{key}_20261111.csv", "wb") as f:
+                  f.write(raw[key])
+
+          # Parse
+          t_lines = raw["title"].decode("utf-8-sig")
+          c_lines = raw["cards"].decode("utf-8-sig")
+
+          t_reader = csv.reader(io.StringIO(t_lines))
+          c_reader = csv.reader(io.StringIO(c_lines))
+
+          t_headers = next(t_reader)
+          c_headers = next(c_reader)
+
+          t_rows = [r for r in t_reader if r]
+          c_rows = [r for r in c_reader if r]
+
+          print(f"TITLE入力行数: {len(t_rows)}")
+          print(f"RACE_CARDS入力行数: {len(c_rows)}")
+
+          t_dict = {}
+          for r in t_rows:
+              d = dict(zip(t_headers, r))
+              t_dict[d["レースコード"]] = d
+
+          c_dict = {}
+          for r in c_rows:
+              d = dict(zip(c_headers, r))
+              c_dict[d["レースコード"]] = d
+
+          t_keys = set(t_dict.keys())
+          c_keys = set(c_dict.keys())
+
+          print(f"重複キー数: TITLE={len(t_rows)-len(t_keys)}, CARDS={len(c_rows)-len(c_keys)}")
+          print(f"キー集合一致: {t_keys == c_keys}")
+
+          # メタ列一致検査
+          meta_cols = ["レース日", "レース場コード", "レース回"]
+          meta_match = True
+          for k in c_keys:
+              for mc in meta_cols:
+                  if t_dict[k][mc] != c_dict[k][mc]:
+                      meta_match = False
+                      break
+
+          print(f"共通メタ列3項目一致: {meta_match}")
+
+          # 結合 (588列)
+          common_cols = ["レースコード", "レース日", "レース場コード", "レース回"]
+          t_unique = [c for c in t_headers if c not in common_cols]
+          out_headers = c_headers + t_unique
+          print(f"結合後の列数: {len(out_headers)}")
+
+          merged_rows = []
+          for k, c_row in c_dict.items():
+              t_row = t_dict[k]
+              m = dict(c_row)
+              for uc in t_unique:
+                  m[uc] = t_row[uc]
+              merged_rows.append(m)
+
+          print(f"結合後の行数: {len(merged_rows)}")
+
+          with open("schema.json", "w", encoding="utf-8") as f:
+              json.dump({"columns": out_headers, "count": len(out_headers)}, f, ensure_ascii=False, indent=2)
+
+          audit = {
+              "title_sha256": hashlib.sha256(raw["title"]).hexdigest(),
+              "cards_sha256": hashlib.sha256(raw["cards"]).hexdigest(),
+              "rows": len(merged_rows),
+              "cols": len(out_headers),
+              "status": "PASS"
+          }
+          print("\n=== AUDIT SUMMARY ===")
+          print(json.dumps(audit, indent=2))
+          EOF
