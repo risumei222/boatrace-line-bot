@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  inspect_meta_diff:
+  normalize_and_audit:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -14,13 +14,20 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Run Meta Diff Audit
+      - name: Run Normalizer & Full Audit
         run: |
           python3 - << 'EOF'
           import urllib.request
           import csv
           import io
           import json
+          import hashlib
+          import os
+          from collections import Counter
+
+          os.makedirs("raw", exist_ok=True)
+          os.makedirs("audit", exist_ok=True)
+          os.makedirs("normalized", exist_ok=True)
 
           urls = {
               "title": "https://boatracecsv.github.io/data/programs/title/2026/11/11.csv",
@@ -29,9 +36,16 @@ jobs:
 
           raw = {}
           for key, url in urls.items():
-              req = urllib.request.Request(url, headers={"User-Agent": "Diff-Audit"})
+              req = urllib.request.Request(url, headers={"User-Agent": "BoatraceCSV-Final-Normalizer"})
               with urllib.request.urlopen(req, timeout=30) as resp:
                   raw[key] = resp.read()
+              # 元CSVを無加工でraw/に保存
+              with open(f"raw/{key}_20261111.csv", "wb") as f:
+                  f.write(raw[key])
+
+          # SHA-256 検証
+          sha_title = hashlib.sha256(raw["title"]).hexdigest()
+          sha_cards = hashlib.sha256(raw["cards"]).hexdigest()
 
           t_reader = csv.reader(io.StringIO(raw["title"].decode("utf-8-sig")))
           c_reader = csv.reader(io.StringIO(raw["cards"].decode("utf-8-sig")))
@@ -39,35 +53,88 @@ jobs:
           t_headers = next(t_reader)
           c_headers = next(c_reader)
 
-          t_dict = {r[0]: dict(zip(t_headers, r)) for r in t_reader if r}
-          c_dict = {r[0]: dict(zip(c_headers, r)) for r in c_reader if r}
+          t_rows = [r for r in t_reader if r]
+          c_rows = [r for r in c_reader if r]
 
-          meta_cols = ["レース日", "レース場コード", "レース回"]
-          diff_results = {col: [] for col in meta_cols}
+          t_dict = {r[0]: dict(zip(t_headers, r)) for r in t_rows}
+          c_dict = {r[0]: dict(zip(c_headers, r)) for r in c_rows}
 
-          # 144件全件走査
-          for code, c_row in sorted(c_dict.items()):
+          # 1. 結合キー検査
+          t_keys = set(t_dict.keys())
+          c_keys = set(c_dict.keys())
+          key_set_equal = (t_keys == c_keys)
+          key_duplicates = (len(t_rows) - len(t_keys)) + (len(c_rows) - len(c_keys))
+          key_missing = len(t_keys ^ c_keys)
+
+          # 2. 列の分離と結合列順定義（RACE_CARDS 580列 + TITLE固有 8列）
+          common_cols = ["レースコード", "レース日", "レース場コード", "レース回"]
+          t_unique_cols = [c for c in t_headers if c not in common_cols]
+          out_headers = c_headers + t_unique_cols
+
+          # 列名重複検査
+          header_counts = Counter(out_headers)
+          dup_headers = [col for col, count in header_counts.items() if count > 1]
+
+          # 3. 結合実行（レース回はRACE_CARDS側の2桁表記を採用）
+          merged_rows = []
+          round_match_count = 0
+
+          for code in sorted(c_dict.keys()):
+              c_row = c_dict[code]
               t_row = t_dict[code]
-              for col in meta_cols:
-                  t_val = t_row[col]
-                  c_val = c_row[col]
-                  if t_val != c_val:
-                      diff_results[col].append({
-                          "code": code,
-                          "title_raw": repr(t_val),
-                          "cards_raw": repr(c_val)
-                      })
 
-          print("\n=== 項目別不一致件数 ===")
-          for col in meta_cols:
-              print(f"{col}: {len(diff_results[col])} 件")
+              # 結合行生成（RACE_CARDSの全列をベースにし、TITLE固有列を追加）
+              row_data = {col: c_row[col] for col in c_headers}
+              for col in t_unique_cols:
+                  row_data[col] = t_row[col]
 
-          print("\n=== 不一致詳細（全件一覧） ===")
-          for col in meta_cols:
-              if diff_results[col]:
-                  print(f"\n--- 【{col}】不一致全件 ({len(diff_results[col])}件) ---")
-                  for item in diff_results[col]:
-                      print(f"レースコード: {item['code']} | TITLE: {item['title_raw']} | RACE_CARDS: {item['cards_raw']}")
-              else:
-                  print(f"\n--- 【{col}】完全一致 (0件) ---")
+              # 結合後のレース回がRACE_CARDSの2桁表記と一致しているか検証
+              if row_data["レース回"] == c_row["レース回"]:
+                  round_match_count += 1
+
+              merged_rows.append(row_data)
+
+          # 4. 成果物保存
+          norm_csv_path = "normalized/normalized_20261111.csv"
+          with open(norm_csv_path, "w", encoding="utf-8", newline="") as f:
+              writer = csv.DictWriter(f, fieldnames=out_headers)
+              writer.writeheader()
+              writer.writerows(merged_rows)
+
+          schema_path = "schema.json"
+          with open(schema_path, "w", encoding="utf-8") as f:
+              json.dump({"columns": out_headers, "count": len(out_headers)}, f, ensure_ascii=False, indent=2)
+
+          audit_data = {
+              "target_date": "2026-11-11",
+              "input_title_rows": len(t_rows),
+              "input_title_cols": len(t_headers),
+              "input_cards_rows": len(c_rows),
+              "input_cards_cols": len(c_headers),
+              "key_duplicates": key_duplicates,
+              "key_missing": key_missing,
+              "key_set_equal": key_set_equal,
+              "merged_rows": len(merged_rows),
+              "merged_cols": len(out_headers),
+              "duplicate_headers_found": dup_headers,
+              "race_round_adopted": "RACE_CARDS (2-digit)",
+              "race_round_matches": round_match_count,
+              "sha256": {
+                  "title": sha_title,
+                  "cards": sha_cards
+              },
+              "output_files": [
+                  norm_csv_path,
+                  schema_path,
+                  "raw/title_20261111.csv",
+                  "raw/cards_20261111.csv"
+              ],
+              "status": "PASS" if (len(merged_rows) == 144 and len(out_headers) == 588 and key_set_equal and not dup_headers and round_match_count == 144) else "FAIL"
+          }
+
+          with open("audit/audit_20261111.json", "w", encoding="utf-8") as f:
+              json.dump(audit_data, f, ensure_ascii=False, indent=2)
+
+          print("\n=== FINAL NORMALIZATION REPORT ===")
+          print(json.dumps(audit_data, indent=2, ensure_ascii=False))
           EOF
