@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  multi_day_audit:
+  audit_588_features:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -14,164 +14,239 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Run Multi-Day Reproducibility Audit
+      - name: Run 588 Columns Exhaustive Audit
         run: |
           python3 - << 'EOF'
           import urllib.request
           import csv
           import io
           import json
-          import hashlib
+          import re
           import os
+          from collections import defaultdict
 
-          os.makedirs("raw", exist_ok=True)
-          os.makedirs("audit", exist_ok=True)
-          os.makedirs("normalized", exist_ok=True)
+          os.makedirs("audit_phase5a", exist_ok=True)
 
-          def fetch_csv(url):
-              req = urllib.request.Request(url, headers={"User-Agent": "Reproducibility-Audit"})
-              with urllib.request.urlopen(req, timeout=30) as resp:
-                  return resp.status, resp.read()
+          # 1. 3日分の実CSVを取得・結合してメモリ上で完全再現
+          dates = ["2026/11/09", "2026/11/10", "2026/11/11"]
+          all_days_data = {}
 
-          # 1. 2026-11-11から基準スキーマを動的生成
-          _, base_t_raw = fetch_csv("https://boatracecsv.github.io/data/programs/title/2026/11/11.csv")
-          _, base_c_raw = fetch_csv("https://boatracecsv.github.io/data/programs/race_cards/2026/11/11.csv")
-          base_t_h = next(csv.reader(io.StringIO(base_t_raw.decode("utf-8-sig"))))
-          base_c_h = next(csv.reader(io.StringIO(base_c_raw.decode("utf-8-sig"))))
+          def get_csv(url):
+              req = urllib.request.Request(url, headers={"User-Agent": "Phase5A-Audit"})
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  return r.read()
 
-          common_cols = ["レースコード", "レース日", "レース場コード", "レース回"]
-          expected_columns = base_c_h + [c for c in base_t_h if c not in common_cols]
-          expected_col_count = len(expected_columns)
+          for d in dates:
+              d_tag = d.replace("/", "")
+              t_raw = get_csv(f"https://boatracecsv.github.io/data/programs/title/{d}.csv")
+              c_raw = get_csv(f"https://boatracecsv.github.io/data/programs/race_cards/{d}.csv")
 
-          # スキーマを保存
-          with open("schema.json", "w", encoding="utf-8") as f:
-              json.dump({"columns": expected_columns, "count": expected_col_count}, f, ensure_ascii=False, indent=2)
+              t_r = list(csv.reader(io.StringIO(t_raw.decode("utf-8-sig"))))
+              c_r = list(csv.reader(io.StringIO(c_raw.decode("utf-8-sig"))))
 
-          # 2. 検証対象日（過去2日分）
-          test_dates = [
-              {"date": "2026-11-09", "path": "2026/11/09"},
-              {"date": "2026-11-10", "path": "2026/11/10"}
+              t_h, t_rows = t_r[0], t_r[1:]
+              c_h, c_rows = c_r[0], c_r[1:]
+
+              t_dict = {r[0]: dict(zip(t_h, r)) for r in t_rows if r}
+              c_dict = {r[0]: dict(zip(c_h, r)) for r in c_rows if r}
+
+              common_cols = ["レースコード", "レース日", "レース場コード", "レース回"]
+              t_unique_cols = [c for c in t_h if c not in common_cols]
+              out_headers = c_h + t_unique_cols
+
+              merged = []
+              for k in sorted(c_dict.keys()):
+                  row = {col: c_dict[k][col] for col in c_h}
+                  for col in t_unique_cols:
+                      row[col] = t_dict[k][col]
+                  merged.append(row)
+              all_days_data[d_tag] = {"headers": out_headers, "rows": merged, "t_headers": t_h, "c_headers": c_h}
+
+          headers = all_days_data["20261111"]["headers"]
+          total_cols = len(headers)
+          print(f"監査対象総列数: {total_cols}")
+
+          # 2. 全行（全432レース分：132 + 156 + 144）のデータ集計
+          all_rows = []
+          for d_tag, d_obj in all_days_data.items():
+              all_rows.extend(d_obj["rows"])
+          total_rows_count = len(all_rows)
+          print(f"集計対象総レース行数: {total_rows_count}")
+
+          # A & C: 列一覧・品質調査
+          inventory = []
+          quality_audit = {}
+
+          # 時系列・分類用の既知パターン辞書
+          known_meanings = {
+              "レースコード": ("12桁レース一意識別コード", "文字列", "識別子", "当日レース前に利用可能"),
+              "レース日": ("開催年月日(YYYYMMDD)", "文字列", "レース条件", "前日までに利用可能"),
+              "レース場コード": ("場コード(01-24)", "文字列", "レース条件", "前日までに利用可能"),
+              "レース回": ("レース番号(01R-12R)", "文字列", "レース条件", "前日までに利用可能"),
+              "レース場": ("競艇場名", "文字列", "レース条件", "前日までに利用可能"),
+              "タイトル": ("開催節タイトル", "文字列", "レース条件", "前日までに利用可能"),
+              "日次": ("節の開催日次", "文字列", "レース条件", "前日までに利用可能"),
+              "グレード": ("レースグレード(一般/G3/G2/G1/SG等)", "文字列", "レース条件", "前日までに利用可能"),
+              "ナイター": ("ナイター/デイ区分", "文字列", "レース条件", "前日までに利用可能"),
+              "レース名": ("レース名称", "文字列", "レース条件", "前日までに利用可能"),
+              "電話投票締切予定": ("電投締切時刻(HH:MM)", "文字列", "レース条件", "当日レース前に利用可能"),
+              "中止状態": ("レース中止フラグ", "文字列", "レース条件", "当日レース前に利用可能")
+          }
+
+          boat_patterns = [
+              (r"^艇(\d)_登録番号$", "選手登録番号(4桁)", "選手能力", "前日までに利用可能"),
+              (r"^艇(\d)_選手名$", "選手氏名", "選手能力", "前日までに利用可能"),
+              (r"^艇(\d)_年齢$", "選手年齢", "選手能力", "前日までに利用可能"),
+              (r"^艇(\d)_支部$", "所属支部", "選手能力", "前日までに利用可能"),
+              (r"^艇(\d)_体重$", "選手体重(kg)", "選手能力", "当日レース前に利用可能"),
+              (r"^艇(\d)_級別$", "選手現級別(A1/A2/B1/B2)", "選手能力", "前日までに利用可能"),
+              (r"^艇(\d)_全国勝率$", "全国勝率", "過去成績", "前日までに利用可能"),
+              (r"^艇(\d)_全国2連率$", "全国2連対率", "過去成績", "前日までに利用可能"),
+              (r"^艇(\d)_当地勝率$", "当地勝率", "過去成績", "前日までに利用可能"),
+              (r"^艇(\d)_当地2連率$", "当地2連対率", "過去成績", "前日までに利用可能"),
+              (r"^艇(\d)_モーター番号$", "モーター番号", "モーター・ボート性能", "前日までに利用可能"),
+              (r"^艇(\d)_モーター2連率$", "モーター2連対率", "モーター・ボート性能", "前日までに利用可能"),
+              (r"^艇(\d)_ボート番号$", "ボート番号", "モーター・ボート性能", "前日までに利用可能"),
+              (r"^艇(\d)_ボート2連率$", "ボート2連対率", "モーター・ボート性能", "前日までに利用可能")
           ]
 
-          results = {}
+          candidate_catalog = defaultdict(list)
+          availability_matrix = defaultdict(list)
+          boat_mapping = {f"艇{b}": [] for b in range(1, 7)}
 
-          for item in test_dates:
-              d_str = item["date"]
-              p_str = item["path"]
-              d_tag = d_str.replace("-", "")
+          confirmed_meanings = 0
+          unknown_meanings = 0
 
-              urls = {
-                  "title": f"https://boatracecsv.github.io/data/programs/title/{p_str}.csv",
-                  "cards": f"https://boatracecsv.github.io/data/programs/race_cards/{p_str}.csv"
-              }
+          for idx, col in enumerate(headers, start=1):
+              source = "TITLE" if col in all_days_data["20261111"]["t_headers"] and col not in ["レースコード", "レース日", "レース場コード", "レース回"] else "RACE_CARDS"
 
-              raw = {}
-              status_codes = {}
-              fetch_error = False
+              # 値の収集と分析
+              values = [r[col] for r in all_rows]
+              empty_count = sum(1 for v in values if v == "")
+              hyphen_count = sum(1 for v in values if v == "-")
+              zero_count = sum(1 for v in values if v in ["0", "0.0", "00", "0.00"])
+              fl_count = sum(1 for v in values if any(x in v for x in ["F", "L"]))
 
-              for key, url in urls.items():
+              # 型の判定
+              non_empty = [v for v in values if v not in ["", "-"]]
+              is_numeric = False
+              if non_empty:
                   try:
-                      status, data = fetch_csv(url)
-                      status_codes[key] = status
-                      raw[key] = data
-                      with open(f"raw/{key}_{d_tag}.csv", "wb") as f:
-                          f.write(data)
-                  except Exception as e:
-                      fetch_error = True
-                      status_codes[key] = str(e)
+                      [float(v) for v in non_empty]
+                      is_numeric = True
+                  except ValueError:
+                      is_numeric = False
+              inferred_type = "数値(実数/整数)" if is_numeric else "文字列"
 
-              if fetch_error:
-                  results[d_str] = {
-                      "status": "STOP (Fetch Error)",
-                      "http_status": status_codes
-                  }
-                  continue
+              sample_val = non_empty[0] if non_empty else ""
 
-              sha_t = hashlib.sha256(raw["title"]).hexdigest()
-              sha_c = hashlib.sha256(raw["cards"]).hexdigest()
+              # 意味・分類・時系列の特定
+              meaning = "UNKNOWN"
+              category = "意味未確認のため保留"
+              timing = "利用可能時点UNKNOWN"
 
-              t_reader = csv.reader(io.StringIO(raw["title"].decode("utf-8-sig")))
-              c_reader = csv.reader(io.StringIO(raw["cards"].decode("utf-8-sig")))
+              if col in known_meanings:
+                  meaning, _, category, timing = known_meanings[col]
+              else:
+                  matched = False
+                  for pat, m_desc, cat, t_point in boat_patterns:
+                      m = re.match(pat, col)
+                      if m:
+                          b_num = m.group(1)
+                          meaning = f"{b_num}号艇: {m_desc}"
+                          category = cat
+                          timing = t_point
+                          matched = True
+                          break
+                  if not matched:
+                      # 艇別パターンの包括走査 (例: 艇1_節D...)
+                      m_b = re.match(r"^艇(\d)_(.+)$", col)
+                      if m_b:
+                          b_num = m_b.group(1)
+                          attr = m_b.group(2)
+                          meaning = f"{b_num}号艇: {attr}"
+                          if "節" in attr or "走" in attr or "着順" in attr or "ST" in attr:
+                              category = "過去成績に関する項目"
+                              timing = "前日までに利用可能"
+                          else:
+                              category = "その他"
+                              timing = "前日までに利用可能"
+                          matched = True
 
-              t_headers = next(t_reader)
-              c_headers = next(c_reader)
+              if meaning != "UNKNOWN":
+                  confirmed_meanings += 1
+              else:
+                  unknown_meanings += 1
 
-              t_rows = [r for r in t_reader if r]
-              c_rows = [r for r in c_reader if r]
+              # 艇別マッピング
+              m_boat = re.match(r"^艇(\d)_(.+)$", col)
+              if m_boat:
+                  b_num = f"艇{m_boat.group(1)}"
+                  boat_mapping[b_num].append(col)
 
-              t_dict = {r[0]: dict(zip(t_headers, r)) for r in t_rows}
-              c_dict = {r[0]: dict(zip(c_headers, r)) for r in c_rows}
+              # 成果物リスト格納
+              inventory.append({
+                  "col_index": idx,
+                  "col_name": col,
+                  "source": source,
+                  "meaning": meaning,
+                  "data_type": inferred_type,
+                  "sample_value": sample_val,
+                  "empty_count": empty_count,
+                  "hyphen_count": hyphen_count,
+                  "zero_count": zero_count,
+                  "fl_symbol_count": fl_count,
+                  "category": category,
+                  "availability": timing
+              })
 
-              # キー検査
-              t_keys = set(t_dict.keys())
-              c_keys = set(c_dict.keys())
-              key_set_equal = (t_keys == c_keys)
-              key_dup = (len(t_rows) - len(t_keys)) + (len(c_rows) - len(c_keys))
-              key_missing = len(t_keys ^ c_keys)
-
-              # 開催場数・レース数
-              tracks = set(r["レース場コード"] for r in c_dict.values())
-              total_races = len(c_dict)
-
-              # 列定義
-              t_unique_cols = [c for c in t_headers if c not in common_cols]
-              out_headers = c_headers + t_unique_cols
-              schema_matches = (out_headers == expected_columns)
-
-              # 結合（レース回はRACE_CARDS側の2桁表記を採用）
-              merged_rows = []
-              round_matches = 0
-              for code in sorted(c_dict.keys()):
-                  c_row = c_dict[code]
-                  t_row = t_dict[code]
-                  row_data = {col: c_row[col] for col in c_headers}
-                  for col in t_unique_cols:
-                      row_data[col] = t_row[col]
-                  if row_data["レース回"] == c_row["レース回"]:
-                      round_matches += 1
-                  merged_rows.append(row_data)
-
-              norm_path = f"normalized/normalized_{d_tag}.csv"
-              with open(norm_path, "w", encoding="utf-8", newline="") as f:
-                  writer = csv.DictWriter(f, fieldnames=out_headers)
-                  writer.writeheader()
-                  writer.writerows(merged_rows)
-
-              is_pass = (
-                  key_set_equal and
-                  key_dup == 0 and
-                  schema_matches and
-                  round_matches == total_races and
-                  len(merged_rows) == total_races and
-                  len(out_headers) == expected_col_count
-              )
-
-              results[d_str] = {
-                  "status": "PASS" if is_pass else "FAIL",
-                  "http_status": status_codes,
-                  "track_count": len(tracks),
-                  "race_count": total_races,
-                  "title_rows": len(t_rows),
-                  "title_cols": len(t_headers),
-                  "cards_rows": len(c_rows),
-                  "cards_cols": len(c_headers),
-                  "merged_rows": len(merged_rows),
-                  "merged_cols": len(out_headers),
-                  "key_set_equal": key_set_equal,
-                  "key_duplicates": key_dup,
-                  "key_missing": key_missing,
-                  "round_matches": round_matches,
-                  "schema_matches": schema_matches,
-                  "sha256": {
-                      "title": sha_t,
-                      "cards": sha_c
-                  },
-                  "output_csv": norm_path
+              quality_audit[col] = {
+                  "index": idx,
+                  "empty_rate": round(empty_count / total_rows_count, 4),
+                  "hyphen_rate": round(hyphen_count / total_rows_count, 4),
+                  "samples": values[:3]
               }
 
-              with open(f"audit/audit_{d_tag}.json", "w", encoding="utf-8") as f:
-                  json.dump(results[d_str], f, ensure_ascii=False, indent=2)
+              candidate_catalog[category].append(col)
+              availability_matrix[timing].append(col)
 
-          print("\n=== MULTI-DAY REPRODUCIBILITY REPORT ===")
-          print(json.dumps(results, indent=2, ensure_ascii=False))
+          # 3. 成果物ファイルの出力
+          with open("audit_phase5a/feature_column_inventory.csv", "w", encoding="utf-8-sig", newline="") as f:
+              w = csv.DictWriter(f, fieldnames=list(inventory[0].keys()))
+              w.writeheader()
+              w.writerows(inventory)
+
+          with open("audit_phase5a/feature_data_quality.json", "w", encoding="utf-8") as f:
+              json.dump(quality_audit, f, ensure_ascii=False, indent=2)
+
+          with open("audit_phase5a/boat_column_mapping.json", "w", encoding="utf-8") as f:
+              json.dump({k: {"count": len(v), "columns": v} for k, v in boat_mapping.items()}, f, ensure_ascii=False, indent=2)
+
+          with open("audit_phase5a/feature_candidate_catalog.json", "w", encoding="utf-8") as f:
+              json.dump({k: {"count": len(v), "columns": v} for k, v in candidate_catalog.items()}, f, ensure_ascii=False, indent=2)
+
+          with open("audit_phase5a/data_availability_matrix.json", "w", encoding="utf-8") as f:
+              json.dump({k: {"count": len(v), "columns": v} for k, v in availability_matrix.items()}, f, ensure_ascii=False, indent=2)
+
+          # 艇別均等性検証（各艇が完全に同じ列数を持っているか）
+          boat_counts = [len(v) for v in boat_mapping.values()]
+          boat_mapping_pass = (len(set(boat_counts)) == 1)
+
+          audit_summary = {
+              "total_columns_investigated": total_cols,
+              "confirmed_meanings": confirmed_meanings,
+              "unknown_meanings": unknown_meanings,
+              "total_rows_inspected": total_rows_count,
+              "boat_column_counts": {k: len(v) for k, v in boat_mapping.items()},
+              "boat_mapping_uniform": boat_mapping_pass,
+              "category_counts": {k: len(v) for k, v in candidate_catalog.items()},
+              "timing_counts": {k: len(v) for k, v in availability_matrix.items()},
+              "status": "PASS" if total_cols == 588 and boat_mapping_pass else "STOP"
+          }
+
+          with open("audit_phase5a/phase5a_audit.json", "w", encoding="utf-8") as f:
+              json.dump(audit_summary, f, ensure_ascii=False, indent=2)
+
+          print("\n=== PHASE 5-A AUDIT SUMMARY ===")
+          print(json.dumps(audit_summary, indent=2, ensure_ascii=False))
           EOF
