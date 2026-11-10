@@ -23,18 +23,31 @@ jobs:
           import json
           import hashlib
           import os
-          from collections import Counter
 
           os.makedirs("raw", exist_ok=True)
           os.makedirs("audit", exist_ok=True)
           os.makedirs("normalized", exist_ok=True)
 
-          # 基準スキーマの読み込み
-          with open("schema.json", "r", encoding="utf-8") as f:
-              ref_schema = json.load(f)
-              expected_columns = ref_schema["columns"]
-              expected_col_count = ref_schema["count"]
+          def fetch_csv(url):
+              req = urllib.request.Request(url, headers={"User-Agent": "Reproducibility-Audit"})
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  return resp.status, resp.read()
 
+          # 1. 2026-11-11から基準スキーマを動的生成
+          _, base_t_raw = fetch_csv("https://boatracecsv.github.io/data/programs/title/2026/11/11.csv")
+          _, base_c_raw = fetch_csv("https://boatracecsv.github.io/data/programs/race_cards/2026/11/11.csv")
+          base_t_h = next(csv.reader(io.StringIO(base_t_raw.decode("utf-8-sig"))))
+          base_c_h = next(csv.reader(io.StringIO(base_c_raw.decode("utf-8-sig"))))
+
+          common_cols = ["レースコード", "レース日", "レース場コード", "レース回"]
+          expected_columns = base_c_h + [c for c in base_t_h if c not in common_cols]
+          expected_col_count = len(expected_columns)
+
+          # スキーマを保存
+          with open("schema.json", "w", encoding="utf-8") as f:
+              json.dump({"columns": expected_columns, "count": expected_col_count}, f, ensure_ascii=False, indent=2)
+
+          # 2. 検証対象日（過去2日分）
           test_dates = [
               {"date": "2026-11-09", "path": "2026/11/09"},
               {"date": "2026-11-10", "path": "2026/11/10"}
@@ -57,13 +70,12 @@ jobs:
               fetch_error = False
 
               for key, url in urls.items():
-                  req = urllib.request.Request(url, headers={"User-Agent": "Reproducibility-Audit"})
                   try:
-                      with urllib.request.urlopen(req, timeout=30) as resp:
-                          status_codes[key] = resp.status
-                          raw[key] = resp.read()
+                      status, data = fetch_csv(url)
+                      status_codes[key] = status
+                      raw[key] = data
                       with open(f"raw/{key}_{d_tag}.csv", "wb") as f:
-                          f.write(raw[key])
+                          f.write(data)
                   except Exception as e:
                       fetch_error = True
                       status_codes[key] = str(e)
@@ -102,14 +114,11 @@ jobs:
               total_races = len(c_dict)
 
               # 列定義
-              common_cols = ["レースコード", "レース日", "レース場コード", "レース回"]
               t_unique_cols = [c for c in t_headers if c not in common_cols]
               out_headers = c_headers + t_unique_cols
-
-              # schema.json との一致確認
               schema_matches = (out_headers == expected_columns)
 
-              # 結合
+              # 結合（レース回はRACE_CARDS側の2桁表記を採用）
               merged_rows = []
               round_matches = 0
               for code in sorted(c_dict.keys()):
