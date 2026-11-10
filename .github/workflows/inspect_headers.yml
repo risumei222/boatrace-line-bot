@@ -1,0 +1,61 @@
+name: inspect-headers
+on:
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run Header Inspection
+        run: |
+          python3 - << 'EOF'
+          import urllib.request
+          import csv
+          import io
+          from collections import Counter
+
+          urls = {
+              "TITLE": "https://boatracecsv.github.io/data/programs/title/2026/11/11.csv",
+              "RACE_CARDS": "https://boatracecsv.github.io/data/programs/race_cards/2026/11/11.csv"
+          }
+
+          headers = {}
+          for name, url in urls.items():
+              req = urllib.request.Request(
+                  url,
+                  headers={"User-Agent": "BoatraceCSV-Header-Audit"}
+              )
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  raw = response.read()
+                  print(f"\n=== {name} ===")
+                  print("HTTP:", response.status)
+                  print("Bytes:", len(raw))
+
+              text = raw.decode("utf-8-sig")
+              headers[name] = next(csv.reader(io.StringIO(text)))
+              cols = headers[name]
+              print("Column count:", len(cols))
+              for i, col in enumerate(cols, 1):
+                  print(f"{i:03d}: {col!r}")
+
+              duplicates = [
+                  col for col, count in Counter(cols).items()
+                  if count > 1
+              ]
+              print("Duplicate column names:", duplicates)
+
+          title_cols = headers["TITLE"]
+          cards_cols = headers["RACE_CARDS"]
+
+          common = [col for col in title_cols if col in set(cards_cols)]
+          print("\n=== COMMON COLUMNS ===")
+          print("Count:", len(common))
+          for col in common:
+              print(repr(col))
+
+          print("\n=== EXPECTED JOIN CHECK ===")
+          print("TITLE:", len(title_cols))
+          print("RACE_CARDS:", len(cards_cols))
+          print("COMMON:", len(common))
+          print("JOINED:", len(title_cols) + len(cards_cols) - len(common))
+          EOF
