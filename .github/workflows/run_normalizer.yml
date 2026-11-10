@@ -23,12 +23,12 @@ jobs:
           import json
           import hashlib
           import os
-          from collections import defaultdict
+          from collections import defaultdict, Counter
 
           os.makedirs("features", exist_ok=True)
           os.makedirs("audit_phase5b", exist_ok=True)
 
-          # 1. 3日分の実CSVを取得・正規化（メモリ上および検証用）
+          # 1. 3日分の実CSVを取得・正規化
           dates = ["2026/11/09", "2026/11/10", "2026/11/11"]
           all_days = {}
 
@@ -68,7 +68,6 @@ jobs:
                   "cards_sha": hashlib.sha256(c_raw).hexdigest()
               }
 
-          # 全432レースを統合
           all_races = []
           for d_tag in sorted(all_days.keys()):
               all_races.extend(all_days[d_tag]["rows"])
@@ -77,7 +76,6 @@ jobs:
           print(f"入力レース数: {total_races}")
 
           # 2. race_features の生成（1レース1行）
-          # レース条件メタ情報（前日までに確定 / 当日確定の分離を保持）
           race_meta_cols = [
               "レースコード", "レース日", "レース場コード", "レース場",
               "レース回", "タイトル", "日次", "グレード", "ナイター",
@@ -90,7 +88,6 @@ jobs:
               race_features.append(rf_row)
 
           # 3. boat_features の生成（1レース6艇、1艇1行）
-          # 主キー: レースコード + 艇番
           boat_features = []
           missing_stats = defaultdict(int)
 
@@ -107,12 +104,10 @@ jobs:
                   missing_stats[f"{col_name}:NON_NUMERIC"] += 1
                   return None, "NON_NUMERIC"
 
-          # 各レース内で6艇を反復処理し、同一レース内中立比較（順位・偏差）も算出
           for r in all_races:
               rcode = r["レースコード"]
               r_boat_rows = []
 
-              # 6艇の基礎数値をまず抽出
               for b in range(1, 7):
                   prefix = f"艇{b}_"
                   reg_no = r.get(f"{prefix}登録番号", "")
@@ -144,14 +139,12 @@ jobs:
                       "レースコード": rcode,
                       "艇番": b,
                       "艇主キー": f"{rcode}_{b}",
-                      # 原文文字列保持
                       "選手登録番号": reg_no,
                       "選手名": name,
                       "支部": branch,
                       "現級別": rank,
                       "モーター番号": m_no,
                       "ボート番号": b_no,
-                      # 数値化特徴量（Noneは欠損）
                       "年齢_num": age_num if age_num is not None else "",
                       "体重_num": weight_num if weight_num is not None else "",
                       "全国勝率_num": nat_win_num if nat_win_num is not None else "",
@@ -160,20 +153,17 @@ jobs:
                       "当地2連率_num": loc_2p_num if loc_2p_num is not None else "",
                       "モーター2連率_num": m_2p_num if m_2p_num is not None else "",
                       "ボート2連率_num": b_2p_num if b_2p_num is not None else "",
-                      # 内部比較用実数値
                       "_nat_win": nat_win_num,
                       "_loc_win": loc_win_num,
                       "_m_2p": m_2p_num
                   }
                   r_boat_rows.append(b_row)
 
-              # 同一レース内の中立比較（全国勝率順位、モーター2連率順位：同値は同一順位）
               valid_nat_wins = [(br["_nat_win"], br["艇番"]) for br in r_boat_rows if br["_nat_win"] is not None]
               valid_m_2ps = [(br["_m_2p"], br["艇番"]) for br in r_boat_rows if br["_m_2p"] is not None]
 
               nat_ranks = {}
               if len(valid_nat_wins) == 6:
-                  # 降順ソート
                   sorted_wins = sorted(valid_nat_wins, key=lambda x: x[0], reverse=True)
                   for rk, (val, b_idx) in enumerate(sorted_wins, start=1):
                       nat_ranks[b_idx] = rk
@@ -214,66 +204,4 @@ jobs:
               {"feature_name": "当地2連率_num", "source_col": "艇X_当地2連率", "type": "float", "availability": "PREVIOUS_DAY", "unit": "%", "desc": "当地2連対率実数値"},
               {"feature_name": "モーター2連率_num", "source_col": "艇X_モーター2連率", "type": "float", "availability": "PREVIOUS_DAY", "unit": "%", "desc": "モーター2連対率実数値"},
               {"feature_name": "ボート2連率_num", "source_col": "艇X_ボート2連率", "type": "float", "availability": "PREVIOUS_DAY", "unit": "%", "desc": "ボート2連対率実数値"},
-              {"feature_name": "レース内_全国勝率順位", "source_col": "相対計算", "type": "integer", "availability": "PREVIOUS_DAY", "unit": "1-6", "desc": "レース内全国勝率順位(同値同順)"},
-              {"feature_name": "レース内_モーター2連率順位", "source_col": "相対計算", "type": "integer", "availability": "PREVIOUS_DAY", "unit": "1-6", "desc": "レース内モーター2連率順位(同値同順)"}
-          ]
-
-          # 5. ファイル保存
-          race_feat_path = "features/race_features.csv"
-          with open(race_feat_path, "w", encoding="utf-8-sig", newline="") as f:
-              w = csv.DictWriter(f, fieldnames=list(race_features[0].keys()))
-              w.writeheader()
-              w.writerows(race_features)
-
-          boat_feat_path = "features/boat_features.csv"
-          with open(boat_feat_path, "w", encoding="utf-8-sig", newline="") as f:
-              w = csv.DictWriter(f, fieldnames=list(boat_features[0].keys()))
-              w.writeheader()
-              w.writerows(boat_features)
-
-          with open("features/feature_manifest.json", "w", encoding="utf-8") as f:
-              json.dump(manifest, f, ensure_ascii=False, indent=2)
-
-          with open("features/feature_quality.json", "w", encoding="utf-8") as f:
-              json.dump(missing_stats, f, ensure_ascii=False, indent=2)
-
-          # 6. 検証・監査
-          boat_keys = [b["艇主キー"] for b in boat_features]
-          boat_key_dups = len(boat_keys) - len(set(boat_keys))
-          per_race_boat_counts = Counter(b["レースコード"] for b in boat_features)
-          race_boat_valid = all(cnt == 6 for cnt in per_race_boat_counts.values())
-
-          audit_summary = {
-              "target_dates": ["2026-11-09", "2026-11-10", "2026-11-11"],
-              "input_races": total_races,
-              "race_features_rows": len(race_features),
-              "race_features_cols": len(race_features[0]),
-              "boat_features_rows": len(boat_features),
-              "boat_features_cols": len(boat_features[0]),
-              "boat_primary_key_duplicates": boat_key_dups,
-              "all_races_have_exact_6_boats": race_boat_valid,
-              "features_defined_count": len(manifest),
-              "data_leak_detected": False,
-              "availability_breakdown": {
-                  "PREVIOUS_DAY": sum(1 for m in manifest if m["availability"] == "PREVIOUS_DAY"),
-                  "RACE_DAY_BEFORE_START": sum(1 for m in manifest if m["availability"] == "RACE_DAY_BEFORE_START"),
-                  "UNKNOWN": sum(1 for m in manifest if m["availability"] == "UNKNOWN"),
-                  "POST_RACE": sum(1 for m in manifest if m["availability"] == "POST_RACE")
-              },
-              "raw_sha256": {d: {"title": all_days[d]["title_sha"], "cards": all_days[d]["cards_sha"]} for d in sorted(all_days.keys())},
-              "output_files": [
-                  race_feat_path,
-                  boat_feat_path,
-                  "features/feature_manifest.json",
-                  "features/feature_quality.json",
-                  "features/phase5b_audit.json"
-              ],
-              "status": "PASS" if (len(race_features) == total_races and len(boat_features) == total_races * 6 and boat_key_dups == 0 and race_boat_valid) else "STOP"
-          }
-
-          with open("features/phase5b_audit.json", "w", encoding="utf-8") as f:
-              json.dump(audit_summary, f, ensure_ascii=False, indent=2)
-
-          print("\n=== PHASE 5-B AUDIT SUMMARY ===")
-          print(json.dumps(audit_summary, indent=2, ensure_ascii=False))
-          EOF
+              {"feature_name": "レース内_全国勝率順位", "source_col": "相対計算", "type": "integer", "availability": "PREVIOUS_DAY", "unit": "1-6",
