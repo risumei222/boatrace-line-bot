@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  normalize_and_audit:
+  multi_day_audit:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -14,7 +14,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Run Normalizer & Full Audit
+      - name: Run Multi-Day Reproducibility Audit
         run: |
           python3 - << 'EOF'
           import urllib.request
@@ -29,112 +29,140 @@ jobs:
           os.makedirs("audit", exist_ok=True)
           os.makedirs("normalized", exist_ok=True)
 
-          urls = {
-              "title": "https://boatracecsv.github.io/data/programs/title/2026/11/11.csv",
-              "cards": "https://boatracecsv.github.io/data/programs/race_cards/2026/11/11.csv"
-          }
+          # 基準スキーマの読み込み
+          with open("schema.json", "r", encoding="utf-8") as f:
+              ref_schema = json.load(f)
+              expected_columns = ref_schema["columns"]
+              expected_col_count = ref_schema["count"]
 
-          raw = {}
-          for key, url in urls.items():
-              req = urllib.request.Request(url, headers={"User-Agent": "BoatraceCSV-Final-Normalizer"})
-              with urllib.request.urlopen(req, timeout=30) as resp:
-                  raw[key] = resp.read()
-              # 元CSVを無加工でraw/に保存
-              with open(f"raw/{key}_20261111.csv", "wb") as f:
-                  f.write(raw[key])
+          test_dates = [
+              {"date": "2026-11-09", "path": "2026/11/09"},
+              {"date": "2026-11-10", "path": "2026/11/10"}
+          ]
 
-          # SHA-256 検証
-          sha_title = hashlib.sha256(raw["title"]).hexdigest()
-          sha_cards = hashlib.sha256(raw["cards"]).hexdigest()
+          results = {}
 
-          t_reader = csv.reader(io.StringIO(raw["title"].decode("utf-8-sig")))
-          c_reader = csv.reader(io.StringIO(raw["cards"].decode("utf-8-sig")))
+          for item in test_dates:
+              d_str = item["date"]
+              p_str = item["path"]
+              d_tag = d_str.replace("-", "")
 
-          t_headers = next(t_reader)
-          c_headers = next(c_reader)
+              urls = {
+                  "title": f"https://boatracecsv.github.io/data/programs/title/{p_str}.csv",
+                  "cards": f"https://boatracecsv.github.io/data/programs/race_cards/{p_str}.csv"
+              }
 
-          t_rows = [r for r in t_reader if r]
-          c_rows = [r for r in c_reader if r]
+              raw = {}
+              status_codes = {}
+              fetch_error = False
 
-          t_dict = {r[0]: dict(zip(t_headers, r)) for r in t_rows}
-          c_dict = {r[0]: dict(zip(c_headers, r)) for r in c_rows}
+              for key, url in urls.items():
+                  req = urllib.request.Request(url, headers={"User-Agent": "Reproducibility-Audit"})
+                  try:
+                      with urllib.request.urlopen(req, timeout=30) as resp:
+                          status_codes[key] = resp.status
+                          raw[key] = resp.read()
+                      with open(f"raw/{key}_{d_tag}.csv", "wb") as f:
+                          f.write(raw[key])
+                  except Exception as e:
+                      fetch_error = True
+                      status_codes[key] = str(e)
 
-          # 1. 結合キー検査
-          t_keys = set(t_dict.keys())
-          c_keys = set(c_dict.keys())
-          key_set_equal = (t_keys == c_keys)
-          key_duplicates = (len(t_rows) - len(t_keys)) + (len(c_rows) - len(c_keys))
-          key_missing = len(t_keys ^ c_keys)
+              if fetch_error:
+                  results[d_str] = {
+                      "status": "STOP (Fetch Error)",
+                      "http_status": status_codes
+                  }
+                  continue
 
-          # 2. 列の分離と結合列順定義（RACE_CARDS 580列 + TITLE固有 8列）
-          common_cols = ["レースコード", "レース日", "レース場コード", "レース回"]
-          t_unique_cols = [c for c in t_headers if c not in common_cols]
-          out_headers = c_headers + t_unique_cols
+              sha_t = hashlib.sha256(raw["title"]).hexdigest()
+              sha_c = hashlib.sha256(raw["cards"]).hexdigest()
 
-          # 列名重複検査
-          header_counts = Counter(out_headers)
-          dup_headers = [col for col, count in header_counts.items() if count > 1]
+              t_reader = csv.reader(io.StringIO(raw["title"].decode("utf-8-sig")))
+              c_reader = csv.reader(io.StringIO(raw["cards"].decode("utf-8-sig")))
 
-          # 3. 結合実行（レース回はRACE_CARDS側の2桁表記を採用）
-          merged_rows = []
-          round_match_count = 0
+              t_headers = next(t_reader)
+              c_headers = next(c_reader)
 
-          for code in sorted(c_dict.keys()):
-              c_row = c_dict[code]
-              t_row = t_dict[code]
+              t_rows = [r for r in t_reader if r]
+              c_rows = [r for r in c_reader if r]
 
-              # 結合行生成（RACE_CARDSの全列をベースにし、TITLE固有列を追加）
-              row_data = {col: c_row[col] for col in c_headers}
-              for col in t_unique_cols:
-                  row_data[col] = t_row[col]
+              t_dict = {r[0]: dict(zip(t_headers, r)) for r in t_rows}
+              c_dict = {r[0]: dict(zip(c_headers, r)) for r in c_rows}
 
-              # 結合後のレース回がRACE_CARDSの2桁表記と一致しているか検証
-              if row_data["レース回"] == c_row["レース回"]:
-                  round_match_count += 1
+              # キー検査
+              t_keys = set(t_dict.keys())
+              c_keys = set(c_dict.keys())
+              key_set_equal = (t_keys == c_keys)
+              key_dup = (len(t_rows) - len(t_keys)) + (len(c_rows) - len(c_keys))
+              key_missing = len(t_keys ^ c_keys)
 
-              merged_rows.append(row_data)
+              # 開催場数・レース数
+              tracks = set(r["レース場コード"] for r in c_dict.values())
+              total_races = len(c_dict)
 
-          # 4. 成果物保存
-          norm_csv_path = "normalized/normalized_20261111.csv"
-          with open(norm_csv_path, "w", encoding="utf-8", newline="") as f:
-              writer = csv.DictWriter(f, fieldnames=out_headers)
-              writer.writeheader()
-              writer.writerows(merged_rows)
+              # 列定義
+              common_cols = ["レースコード", "レース日", "レース場コード", "レース回"]
+              t_unique_cols = [c for c in t_headers if c not in common_cols]
+              out_headers = c_headers + t_unique_cols
 
-          schema_path = "schema.json"
-          with open(schema_path, "w", encoding="utf-8") as f:
-              json.dump({"columns": out_headers, "count": len(out_headers)}, f, ensure_ascii=False, indent=2)
+              # schema.json との一致確認
+              schema_matches = (out_headers == expected_columns)
 
-          audit_data = {
-              "target_date": "2026-11-11",
-              "input_title_rows": len(t_rows),
-              "input_title_cols": len(t_headers),
-              "input_cards_rows": len(c_rows),
-              "input_cards_cols": len(c_headers),
-              "key_duplicates": key_duplicates,
-              "key_missing": key_missing,
-              "key_set_equal": key_set_equal,
-              "merged_rows": len(merged_rows),
-              "merged_cols": len(out_headers),
-              "duplicate_headers_found": dup_headers,
-              "race_round_adopted": "RACE_CARDS (2-digit)",
-              "race_round_matches": round_match_count,
-              "sha256": {
-                  "title": sha_title,
-                  "cards": sha_cards
-              },
-              "output_files": [
-                  norm_csv_path,
-                  schema_path,
-                  "raw/title_20261111.csv",
-                  "raw/cards_20261111.csv"
-              ],
-              "status": "PASS" if (len(merged_rows) == 144 and len(out_headers) == 588 and key_set_equal and not dup_headers and round_match_count == 144) else "FAIL"
-          }
+              # 結合
+              merged_rows = []
+              round_matches = 0
+              for code in sorted(c_dict.keys()):
+                  c_row = c_dict[code]
+                  t_row = t_dict[code]
+                  row_data = {col: c_row[col] for col in c_headers}
+                  for col in t_unique_cols:
+                      row_data[col] = t_row[col]
+                  if row_data["レース回"] == c_row["レース回"]:
+                      round_matches += 1
+                  merged_rows.append(row_data)
 
-          with open("audit/audit_20261111.json", "w", encoding="utf-8") as f:
-              json.dump(audit_data, f, ensure_ascii=False, indent=2)
+              norm_path = f"normalized/normalized_{d_tag}.csv"
+              with open(norm_path, "w", encoding="utf-8", newline="") as f:
+                  writer = csv.DictWriter(f, fieldnames=out_headers)
+                  writer.writeheader()
+                  writer.writerows(merged_rows)
 
-          print("\n=== FINAL NORMALIZATION REPORT ===")
-          print(json.dumps(audit_data, indent=2, ensure_ascii=False))
+              is_pass = (
+                  key_set_equal and
+                  key_dup == 0 and
+                  schema_matches and
+                  round_matches == total_races and
+                  len(merged_rows) == total_races and
+                  len(out_headers) == expected_col_count
+              )
+
+              results[d_str] = {
+                  "status": "PASS" if is_pass else "FAIL",
+                  "http_status": status_codes,
+                  "track_count": len(tracks),
+                  "race_count": total_races,
+                  "title_rows": len(t_rows),
+                  "title_cols": len(t_headers),
+                  "cards_rows": len(c_rows),
+                  "cards_cols": len(c_headers),
+                  "merged_rows": len(merged_rows),
+                  "merged_cols": len(out_headers),
+                  "key_set_equal": key_set_equal,
+                  "key_duplicates": key_dup,
+                  "key_missing": key_missing,
+                  "round_matches": round_matches,
+                  "schema_matches": schema_matches,
+                  "sha256": {
+                      "title": sha_t,
+                      "cards": sha_c
+                  },
+                  "output_csv": norm_path
+              }
+
+              with open(f"audit/audit_{d_tag}.json", "w", encoding="utf-8") as f:
+                  json.dump(results[d_str], f, ensure_ascii=False, indent=2)
+
+          print("\n=== MULTI-DAY REPRODUCIBILITY REPORT ===")
+          print(json.dumps(results, indent=2, ensure_ascii=False))
           EOF
