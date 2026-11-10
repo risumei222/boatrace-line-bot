@@ -3,192 +3,83 @@ on:
   workflow_dispatch:
 
 jobs:
-  build_phase5c_features:
+  probe_beforeinfo:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Run Phase 5-C Feature Pipeline & Audit
+      - name: Probe Beforeinfo Data Sources
         run: |
           python3 - << 'EOF'
-          import urllib.request, csv, io, json, hashlib, os
-          from collections import defaultdict, Counter
+          import urllib.request, csv, io, json, os
 
-          os.makedirs("features", exist_ok=True)
-          os.makedirs("audit_phase5c", exist_ok=True)
+          # 調査対象の日付パターン
+          test_dates = ["2026/11/09", "2026/11/10", "2026/11/11"]
 
-          dates = ["2026/11/09", "2026/11/10", "2026/11/11"]
-          all_races = []
-          raw_shas = {}
+          # BoatraceCSVリポジトリ等で想定される直前情報パス候補
+          url_patterns = [
+              "https://boatracecsv.github.io/data/programs/beforeinfo/{date}.csv",
+              "https://boatracecsv.github.io/data/beforeinfo/{date}.csv",
+              "https://boatracecsv.github.io/data/before_info/{date}.csv",
+              "https://boatracecsv.github.io/data/exhibition/{date}.csv",
+              "https://boatracecsv.github.io/data/programs/exhibition/{date}.csv",
+              "https://boatracecsv.github.io/data/races/beforeinfo/{date}.csv"
+          ]
 
-          def get_csv(url):
-              req = urllib.request.Request(url, headers={"User-Agent": "P5C"})
-              with urllib.request.urlopen(req, timeout=30) as r:
-                  return r.read()
+          probe_results = {}
+          valid_csv_sample = None
+          valid_url_pattern = None
 
-          for d in dates:
-              d_tag = d.replace("/", "")
-              t_raw = get_csv(f"https://boatracecsv.github.io/data/programs/title/{d}.csv")
-              c_raw = get_csv(f"https://boatracecsv.github.io/data/programs/race_cards/{d}.csv")
-              raw_shas[d_tag] = {"title": hashlib.sha256(t_raw).hexdigest(), "cards": hashlib.sha256(c_raw).hexdigest()}
+          for pat in url_patterns:
+              pat_res = {}
+              for d in test_dates:
+                  url = pat.format(date=d)
+                  req = urllib.request.Request(url, headers={"User-Agent": "Phase5D-Probe"})
+                  try:
+                      with urllib.request.urlopen(req, timeout=10) as resp:
+                          status = resp.status
+                          body = resp.read()
+                          pat_res[d] = {"status": status, "bytes": len(body)}
+                          if status == 200 and len(body) > 100 and valid_csv_sample is None:
+                              valid_csv_sample = body
+                              valid_url_pattern = pat
+                  except urllib.error.HTTPError as e:
+                      pat_res[d] = {"status": e.code, "error": str(e)}
+                  except Exception as e:
+                      pat_res[d] = {"status": "ERROR", "error": str(e)}
+              probe_results[pat] = pat_res
 
-              t_r = list(csv.reader(io.StringIO(t_raw.decode("utf-8-sig"))))
-              c_r = list(csv.reader(io.StringIO(c_raw.decode("utf-8-sig"))))
-              t_h, t_rows = t_r[0], t_r[1:]
-              c_h, c_rows = c_r[0], c_r[1:]
+          # 200が確認できた場合のCSV構造解析
+          csv_audit = {}
+          if valid_csv_sample:
+              r = list(csv.reader(io.StringIO(valid_csv_sample.decode("utf-8-sig"))))
+              headers = r[0] if r else []
+              rows = r[1:] if len(r) > 1 else []
 
-              t_dict = {r[0]: dict(zip(t_h, r)) for r in t_rows if r}
-              c_dict = {r[0]: dict(zip(c_h, r)) for r in c_rows if r}
-              common_cols = ["レースコード", "レース日", "レース場コード", "レース回"]
-              t_unique = [c for c in t_h if c not in common_cols]
+              # 項目網羅率チェック
+              target_items = [
+                  "展示タイム", "展示ST", "チルト", "周回", "まわり足", "直線",
+                  "進入", "スタート展示", "レースコード", "艇番"
+              ]
+              found_cols = {item: [h for h in headers if item in h] for item in target_items}
 
-              for k in sorted(c_dict.keys()):
-                  row = {col: c_dict[k][col] for col in c_h}
-                  for col in t_unique:
-                      row[col] = t_dict[k][col]
-                  all_races.append(row)
-
-          total_races = len(all_races)
-          print(f"入力レース数: {total_races}")
-
-          # 1. 展示情報列の存在・充足率監査 (NOT_FOUND確定)
-          sample_headers = list(all_races[0].keys())
-          exhibition_targets = ["展示タイム", "展示ST", "周回", "まわり足", "直線"]
-          exhibition_audit = {}
-          for target in exhibition_targets:
-              matched = [h for h in sample_headers if target in h]
-              exhibition_audit[target] = {
-                  "found_columns": matched,
-                  "coverage_rate": 0.0,
-                  "status": "NOT_FOUND"
+              csv_audit = {
+                  "confirmed_url_pattern": valid_url_pattern,
+                  "total_columns": len(headers),
+                  "total_rows_sample": len(rows),
+                  "headers_preview": headers[:20],
+                  "target_items_found": found_cols,
+                  "has_race_code": "レースコード" in headers
               }
 
-          # 2. race_features_phase5c 生成
-          race_cols = ["レースコード", "レース日", "レース場コード", "レース場", "レース回", "タイトル", "日次", "グレード", "ナイター", "レース名", "電話投票締切予定", "中止状態"]
-          race_features_5c = [{col: r[col] for col in race_cols} for r in all_races]
-
-          # 3. boat_features_phase5c 生成
-          missing_stats = defaultdict(int)
-          def parse_val(v, name):
-              if v == "":
-                  missing_stats[f"{name}:EMPTY"] += 1
-                  return None, "EMPTY"
-              if v == "-":
-                  missing_stats[f"{name}:HYPHEN"] += 1
-                  return None, "HYPHEN"
-              try:
-                  return float(v), "OK"
-              except ValueError:
-                  missing_stats[f"{name}:NON_NUMERIC"] += 1
-                  return None, "NON_NUMERIC"
-
-          boat_features_5c = []
-
-          for r in all_races:
-              rc = r["レースコード"]
-              boats_in_race = []
-
-              for b in range(1, 7):
-                  p = f"艇{b}_"
-                  nw_val, nw_s = parse_val(r.get(f"{p}全国勝率", ""), "全国勝率")
-                  n2_val, n2_s = parse_val(r.get(f"{p}全国2連率", ""), "全国2連率")
-                  lw_val, lw_s = parse_val(r.get(f"{p}当地勝率", ""), "当地勝率")
-                  l2_val, l2_s = parse_val(r.get(f"{p}当地2連率", ""), "当地2連率")
-
-                  # 過去走節間ST実績 (D1〜D3走1の有効値を走査)
-                  st_vals = []
-                  for d_idx in range(1, 4):
-                      st_raw = r.get(f"{p}節D{d_idx}走1ST", "")
-                      st_v, _ = parse_val(st_raw, "節ST")
-                      if st_v is not None:
-                          st_vals.append(st_v)
-                  avg_st = round(sum(st_vals) / len(st_vals), 3) if st_vals else None
-
-                  b_dict = {
-                      "レースコード": rc, "艇番": b, "艇主キー": f"{rc}_{b}",
-                      "選手名": r.get(f"{p}選手名", ""), "現級別": r.get(f"{p}級別", ""),
-                      # 原文保持
-                      "全国勝率_raw": r.get(f"{p}全国勝率", ""),
-                      "全国2連率_raw": r.get(f"{p}全国2連率", ""),
-                      "当地勝率_raw": r.get(f"{p}当地勝率", ""),
-                      "当地2連率_raw": r.get(f"{p}当地2連率", ""),
-                      # 数値化
-                      "全国勝率_num": nw_val, "全国2連率_num": n2_val,
-                      "当地勝率_num": lw_val, "当地2連率_num": l2_val,
-                      "過去走平均ST_num": avg_st,
-                      # 欠損ステータス
-                      "全国勝率_status": nw_s, "全国2連率_status": n2_s,
-                      "当地勝率_status": lw_s, "当地2連率_status": l2_s
-                  }
-                  boats_in_race.append(b_dict)
-
-              # 同一レース内統計量・順位・差分（全国勝率・当地勝率）
-              for metric in ["全国勝率_num", "当地勝率_num"]:
-                  valid_items = [(br[metric], br["艇番"]) for br in boats_in_race if br[metric] is not None]
-                  ranks = {}
-                  diffs = {}
-                  m_mean = None
-                  if len(valid_items) == 6:
-                      vals = [x[0] for x in valid_items]
-                      m_mean = round(sum(vals) / 6.0, 3)
-                      # 降順同値同順位
-                      sorted_items = sorted(valid_items, key=lambda x: x[0], reverse=True)
-                      cur_rank = 1
-                      for i in range(len(sorted_items)):
-                          if i > 0 and sorted_items[i][0] < sorted_items[i-1][0]:
-                              cur_rank = i + 1
-                          ranks[sorted_items[i][1]] = cur_rank
-                          diffs[sorted_items[i][1]] = round(sorted_items[i][0] - m_mean, 3)
-
-                  m_name = metric.replace("_num", "")
-                  for br in boats_in_race:
-                      b_idx = br["艇番"]
-                      br[f"{m_name}_レース内順位"] = ranks.get(b_idx, "")
-                      br[f"{m_name}_レース平均との差"] = diffs.get(b_idx, "")
-
-              # 出力用に数値を文字列整形（Noneは空文字）
-              for br in boats_in_race:
-                  for k in ["全国勝率_num", "全国2連率_num", "当地勝率_num", "当地2連率_num", "過去走平均ST_num"]:
-                      br[k] = "" if br[k] is None else br[k]
-                  boat_features_5c.append(br)
-
-          # 4. ファイル書き出し
-          with open("features/race_features_phase5c.csv", "w", encoding="utf-8-sig", newline="") as f:
-              w = csv.DictWriter(f, fieldnames=list(race_features_5c[0].keys()))
-              w.writeheader()
-              w.writerows(race_features_5c)
-
-          with open("features/boat_features_phase5c.csv", "w", encoding="utf-8-sig", newline="") as f:
-              w = csv.DictWriter(f, fieldnames=list(boat_features_5c[0].keys()))
-              w.writeheader()
-              w.writerows(boat_features_5c)
-
-          # 5. 監査サマリー
-          boat_keys = [b["艇主キー"] for b in boat_features_5c]
-          boat_dups = len(boat_keys) - len(set(boat_keys))
-          per_race_counts = Counter(b["レースコード"] for b in boat_features_5c)
-          race_6_valid = all(cnt == 6 for cnt in per_race_counts.values())
-
-          audit_p5c = {
-              "target_dates": ["2026-11-09", "2026-11-10", "2026-11-11"],
-              "input_races": total_races,
-              "race_features_rows": len(race_features_5c),
-              "race_features_cols": len(race_features_5c[0]),
-              "boat_features_rows": len(boat_features_5c),
-              "boat_features_cols": len(boat_features_5c[0]),
-              "boat_primary_key_duplicates": boat_dups,
-              "all_races_have_exact_6_boats": race_6_valid,
-              "exhibition_data_audit": exhibition_audit,
-              "missing_stats": dict(missing_stats),
-              "raw_sha256": raw_shas,
-              "status": "PASS" if (len(race_features_5c) == total_races and len(boat_features_5c) == total_races * 6 and boat_dups == 0 and race_6_valid) else "STOP"
+          report = {
+              "http_probe": probe_results,
+              "valid_url_found": valid_url_pattern is not None,
+              "csv_audit": csv_audit
           }
 
-          with open("features/phase5c_audit.json", "w", encoding="utf-8") as f:
-              json.dump(audit_p5c, f, ensure_ascii=False, indent=2)
-
-          print("\n=== PHASE 5-C AUDIT SUMMARY ===")
-          print(json.dumps(audit_p5c, indent=2, ensure_ascii=False))
+          print("\n=== PHASE 5-D PROBE REPORT ===")
+          print(json.dumps(report, indent=2, ensure_ascii=False))
           EOF
