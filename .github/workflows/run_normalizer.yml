@@ -17,7 +17,7 @@ jobs:
           from collections import defaultdict
 
           # ==========================================
-          # 1. 独立モジュール engine_a.py の生成（無加工移植）
+          # 1. 独立モジュール engine_a.py の生成
           # ==========================================
           engine_a_code = '''
           EXCLUDED_STADIUMS_SOLID = ["02", "03", "04"] # 戸田, 江戸川, 平和島
@@ -92,15 +92,16 @@ jobs:
               f.write(engine_a_code.strip())
 
           # ==========================================
-          # 2. 独立モジュール engine_b.py の生成（ST修正反映・既存仕様完全維持）
+          # 2. 独立モジュール engine_b.py の生成
           # ==========================================
           engine_b_code = '''
+          import re
+
           def evaluate_engine_b(race_info, b_list):
               """エンジンB：リースメイ式（厳選ホームラン枠）"""
-              try:
-                  rno = int(race_info.get("レース回", 0))
-              except ValueError:
-                  return None, "レース番号不正"
+              rno_str = str(race_info.get("レース回", "0"))
+              rno_clean = re.sub(r"\\D", "", rno_str)
+              rno = int(rno_clean) if rno_clean else 0
 
               title = race_info.get("タイトル", "") + race_info.get("レース名", "")
               is_special = any(k in title for k in ["企画", "ドリーム", "準優勝", "優勝", "女子", "ヴィーナス"])
@@ -184,7 +185,6 @@ jobs:
           NAME_JCD_MAP = {v: k for k, v in JCD_NAME_MAP.items()}
 
           def parse_race_input(text):
-              """「大村5R」「下関12r」等から場名・場コード・レース番号を抽出"""
               text = text.strip()
               m = re.match(r"^([^\d]+?)\s*([0-9]{1,2})\s*[rR]?$", text)
               if not m:
@@ -195,7 +195,6 @@ jobs:
               return jcd, rno
 
           def run_mode_1_candidate_notification(races, boats_by_race):
-              """モード①：事前候補レース一括判定通知"""
               a_hits = []
               b_hits = []
 
@@ -222,7 +221,7 @@ jobs:
                   for rinfo, res in a_hits:
                       stad = rinfo.get("レース場", "")
                       rno = rinfo.get("レース回", "")
-                      lines.append(f"・{stad}{rno}R: {res['reason']}")
+                      lines.append(f"・{stad}{rno}: {res['reason']}")
 
               if b_hits:
                   lines.append("━━━━━━━━━━━━━━━")
@@ -230,21 +229,22 @@ jobs:
                   for rinfo, res in b_hits:
                       stad = rinfo.get("レース場", "")
                       rno = rinfo.get("レース回", "")
-                      lines.append(f"・{stad}{rno}R: {res['keyman']}軸 ({res['reason']})")
+                      lines.append(f"・{stad}{rno}: {res['keyman']}軸 ({res['reason']})")
 
               return "\\n".join(lines)
 
           def run_mode_2_post_exhibition(target_input, races, boats_by_race):
-              """モード②：展示後最終予想応答"""
               jcd, rno = parse_race_input(target_input)
               if not jcd:
                   return "ERROR: レース指定形式が正しくありません。（例: 「大村5R」）"
 
-              # 対象レースの特定
               target_rc = None
               target_rinfo = None
               for rc, rinfo in races.items():
-                  if str(rinfo.get("レース場コード", "")).zfill(2) == jcd and int(rinfo.get("レース回", 0)) == rno:
+                  r_jcd = str(rinfo.get("レース場コード", "")).zfill(2)
+                  r_clean = re.sub(r"\\D", "", str(rinfo.get("レース回", "0")))
+                  r_rno = int(r_clean) if r_clean else 0
+                  if r_jcd == jcd and r_rno == rno:
                       target_rc = rc
                       target_rinfo = rinfo
                       break
@@ -256,12 +256,10 @@ jobs:
               if len(b_list) != 6:
                   return "STOP: 6艇のデータが揃っていません。(UNKNOWN)"
 
-              # 必須展示データの完全性検査
               valid_ex_times = [b for b in b_list if isinstance(b.get("展示タイム"), float)]
               if len(valid_ex_times) < 6:
                   return f"STOP: {target_input} の展示データが未発表または不完全です。展示終了後に再試行してください。(STATUS: UNKNOWN)"
 
-              # A/B 独立判定
               res_a, msg_a = evaluate_engine_a(target_rinfo, b_list)
               res_b, msg_b = evaluate_engine_b(target_rinfo, b_list)
 
@@ -366,7 +364,6 @@ jobs:
           from engine_a import evaluate_engine_a
           from engine_b import evaluate_engine_b
 
-          # A/B 独立判定結果集計
           a_cnt, b_cnt, both_cnt, neither_cnt = 0, 0, 0, 0
           for rc, rinfo in races.items():
               bl = boats_by_race[rc]
@@ -377,19 +374,12 @@ jobs:
               elif ra and rb: both_cnt += 1
               else: neither_cnt += 1
 
-          # E2E シナリオ検証
-          # 1. モード① 全体通知
           mode1_out = run_mode_1_candidate_notification(races, boats_by_race)
 
-          # 2. モード② 応答パターンのテスト
-          # Case A-only: 202611091801 (徳山1R - A該当例)
-          # Case Neither: 202611090201 (戸田1R - イン受難除外)
-          # Case Unknown/STOP: 展示データ未確定レース
           resp_a_only = run_mode_2_post_exhibition("徳山1R", races, boats_by_race)
           resp_neither = run_mode_2_post_exhibition("戸田1R", races, boats_by_race)
-          
-          # 展示データ欠落シミュレーション
-          dummy_races = {"999999999999": {"レース場コード": "24", "レース回": "12", "レース場": "大村"}}
+
+          dummy_races = {"999999999999": {"レース場コード": "24", "レース回": "12R", "レース場": "大村"}}
           dummy_boats = {"999999999999": [{"艇番": i, "展示タイム": ""} for i in range(1, 7)]}
           resp_missing = run_mode_2_post_exhibition("大村12R", dummy_races, dummy_boats)
 
