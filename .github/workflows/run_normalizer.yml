@@ -3,83 +3,78 @@ on:
   workflow_dispatch:
 
 jobs:
-  probe_beforeinfo:
+  probe_official_previews:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Probe Beforeinfo Data Sources
+      - name: Probe Official Previews Datasets
         run: |
           python3 - << 'EOF'
           import urllib.request, csv, io, json, os
 
-          # 調査対象の日付パターン
           test_dates = ["2026/11/09", "2026/11/10", "2026/11/11"]
+          categories = ["tkz", "stt", "sui", "original_exhibition"]
 
-          # BoatraceCSVリポジトリ等で想定される直前情報パス候補
-          url_patterns = [
-              "https://boatracecsv.github.io/data/programs/beforeinfo/{date}.csv",
-              "https://boatracecsv.github.io/data/beforeinfo/{date}.csv",
-              "https://boatracecsv.github.io/data/before_info/{date}.csv",
-              "https://boatracecsv.github.io/data/exhibition/{date}.csv",
-              "https://boatracecsv.github.io/data/programs/exhibition/{date}.csv",
-              "https://boatracecsv.github.io/data/races/beforeinfo/{date}.csv"
-          ]
+          results = {}
 
-          probe_results = {}
-          valid_csv_sample = None
-          valid_url_pattern = None
+          def fetch(url):
+              req = urllib.request.Request(url, headers={"User-Agent": "Phase5D-PreviewsProbe"})
+              try:
+                  with urllib.request.urlopen(req, timeout=15) as resp:
+                      return resp.status, resp.read(), None
+              except urllib.error.HTTPError as e:
+                  return e.code, None, str(e)
+              except Exception as e:
+                  return "ERROR", None, str(e)
 
-          for pat in url_patterns:
-              pat_res = {}
+          for cat in categories:
+              results[cat] = {}
               for d in test_dates:
-                  url = pat.format(date=d)
-                  req = urllib.request.Request(url, headers={"User-Agent": "Phase5D-Probe"})
-                  try:
-                      with urllib.request.urlopen(req, timeout=10) as resp:
-                          status = resp.status
-                          body = resp.read()
-                          pat_res[d] = {"status": status, "bytes": len(body)}
-                          if status == 200 and len(body) > 100 and valid_csv_sample is None:
-                              valid_csv_sample = body
-                              valid_url_pattern = pat
-                  except urllib.error.HTTPError as e:
-                      pat_res[d] = {"status": e.code, "error": str(e)}
-                  except Exception as e:
-                      pat_res[d] = {"status": "ERROR", "error": str(e)}
-              probe_results[pat] = pat_res
+                  url = f"https://boatracecsv.github.io/data/previews/{cat}/{d}.csv"
+                  status, body, err = fetch(url)
+                  cat_res = {"url": url, "status": status}
+                  if status == 200 and body:
+                      cat_res["bytes"] = len(body)
+                      try:
+                          reader = list(csv.reader(io.StringIO(body.decode("utf-8-sig"))))
+                          if reader:
+                              headers = reader[0]
+                              rows = reader[1:]
+                              cat_res["rows"] = len(rows)
+                              cat_res["cols"] = len(headers)
+                              cat_res["headers"] = headers
+                              cat_res["has_race_code"] = "レースコード" in headers
 
-          # 200が確認できた場合のCSV構造解析
-          csv_audit = {}
-          if valid_csv_sample:
-              r = list(csv.reader(io.StringIO(valid_csv_sample.decode("utf-8-sig"))))
-              headers = r[0] if r else []
-              rows = r[1:] if len(r) > 1 else []
+                              # 12桁レースコードのサンプル確認
+                              if "レースコード" in headers and rows:
+                                  idx = headers.index("レースコード")
+                                  cat_res["sample_race_code"] = rows[0][idx] if len(rows[0]) > idx else ""
 
-              # 項目網羅率チェック
-              target_items = [
-                  "展示タイム", "展示ST", "チルト", "周回", "まわり足", "直線",
-                  "進入", "スタート展示", "レースコード", "艇番"
-              ]
-              found_cols = {item: [h for h in headers if item in h] for item in target_items}
+                              # 直前展示主要項目の存在と非空欄率（実測充足率）
+                              target_keywords = [
+                                  "展示タイム", "展示ST", "チルト", "体重", "周回", "まわり足", "直線", "進入"
+                              ]
+                              coverage = {}
+                              for kw in target_keywords:
+                                  matched_cols = [c for c in headers if kw in c]
+                                  if matched_cols:
+                                      for col in matched_cols:
+                                          c_idx = headers.index(col)
+                                          non_empty = sum(1 for r in rows if len(r) > c_idx and r[c_idx] not in ["", "-"])
+                                          rate = round(non_empty / len(rows), 4) if rows else 0.0
+                                          coverage[col] = {"non_empty_count": non_empty, "rate": rate}
+                                  else:
+                                      coverage[kw] = "NOT_FOUND"
+                              cat_res["target_coverage"] = coverage
+                      except Exception as parse_e:
+                          cat_res["parse_error"] = str(parse_e)
+                  else:
+                      cat_res["error"] = err
+                  results[cat][d] = cat_res
 
-              csv_audit = {
-                  "confirmed_url_pattern": valid_url_pattern,
-                  "total_columns": len(headers),
-                  "total_rows_sample": len(rows),
-                  "headers_preview": headers[:20],
-                  "target_items_found": found_cols,
-                  "has_race_code": "レースコード" in headers
-              }
-
-          report = {
-              "http_probe": probe_results,
-              "valid_url_found": valid_url_pattern is not None,
-              "csv_audit": csv_audit
-          }
-
-          print("\n=== PHASE 5-D PROBE REPORT ===")
-          print(json.dumps(report, indent=2, ensure_ascii=False))
+          print("\n=== PHASE 5-D PREVIEWS AUDIT REPORT ===")
+          print(json.dumps(results, indent=2, ensure_ascii=False))
           EOF
