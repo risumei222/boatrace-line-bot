@@ -3,78 +3,240 @@ on:
   workflow_dispatch:
 
 jobs:
-  probe_official_previews:
+  build_common_dataset:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Probe Official Previews Datasets
+      - name: Build Unified Boatrace Common Dataset
         run: |
           python3 - << 'EOF'
           import urllib.request, csv, io, json, os
+          from collections import defaultdict, Counter
 
-          test_dates = ["2026/11/09", "2026/11/10", "2026/11/11"]
-          categories = ["tkz", "stt", "sui", "original_exhibition"]
+          os.makedirs("dataset", exist_ok=True)
+          os.makedirs("audit_common", exist_ok=True)
 
-          results = {}
+          dates = ["2026/11/09", "2026/11/10", "2026/11/11"]
 
-          def fetch(url):
-              req = urllib.request.Request(url, headers={"User-Agent": "Phase5D-PreviewsProbe"})
+          def fetch_csv(url):
+              req = urllib.request.Request(url, headers={"User-Agent": "BR-CommonDataset"})
               try:
                   with urllib.request.urlopen(req, timeout=15) as resp:
-                      return resp.status, resp.read(), None
-              except urllib.error.HTTPError as e:
-                  return e.code, None, str(e)
-              except Exception as e:
-                  return "ERROR", None, str(e)
+                      if resp.status == 200:
+                          return list(csv.reader(io.StringIO(resp.read().decode("utf-8-sig"))))
+              except Exception:
+                  pass
+              return None
 
-          for cat in categories:
-              results[cat] = {}
-              for d in test_dates:
-                  url = f"https://boatracecsv.github.io/data/previews/{cat}/{d}.csv"
-                  status, body, err = fetch(url)
-                  cat_res = {"url": url, "status": status}
-                  if status == 200 and body:
-                      cat_res["bytes"] = len(body)
-                      try:
-                          reader = list(csv.reader(io.StringIO(body.decode("utf-8-sig"))))
-                          if reader:
-                              headers = reader[0]
-                              rows = reader[1:]
-                              cat_res["rows"] = len(rows)
-                              cat_res["cols"] = len(headers)
-                              cat_res["headers"] = headers
-                              cat_res["has_race_code"] = "レースコード" in headers
+          def safe_float(v):
+              if v in ["", "-", None]:
+                  return ""
+              try:
+                  return float(v)
+              except ValueError:
+                  return ""
 
-                              # 12桁レースコードのサンプル確認
-                              if "レースコード" in headers and rows:
-                                  idx = headers.index("レースコード")
-                                  cat_res["sample_race_code"] = rows[0][idx] if len(rows[0]) > idx else ""
+          all_days_races = []
+          audit_sources = defaultdict(dict)
 
-                              # 直前展示主要項目の存在と非空欄率（実測充足率）
-                              target_keywords = [
-                                  "展示タイム", "展示ST", "チルト", "体重", "周回", "まわり足", "直線", "進入"
-                              ]
-                              coverage = {}
-                              for kw in target_keywords:
-                                  matched_cols = [c for c in headers if kw in c]
-                                  if matched_cols:
-                                      for col in matched_cols:
-                                          c_idx = headers.index(col)
-                                          non_empty = sum(1 for r in rows if len(r) > c_idx and r[c_idx] not in ["", "-"])
-                                          rate = round(non_empty / len(rows), 4) if rows else 0.0
-                                          coverage[col] = {"non_empty_count": non_empty, "rate": rate}
-                                  else:
-                                      coverage[kw] = "NOT_FOUND"
-                              cat_res["target_coverage"] = coverage
-                      except Exception as parse_e:
-                          cat_res["parse_error"] = str(parse_e)
-                  else:
-                      cat_res["error"] = err
-                  results[cat][d] = cat_res
+          for d in dates:
+              d_tag = d.replace("/", "")
+              # 1. 出走表
+              t_data = fetch_csv(f"https://boatracecsv.github.io/data/programs/title/{d}.csv")
+              c_data = fetch_csv(f"https://boatracecsv.github.io/data/programs/race_cards/{d}.csv")
+              # 2. 直前情報
+              tkz_data = fetch_csv(f"https://boatracecsv.github.io/data/previews/tkz/{d}.csv")
+              stt_data = fetch_csv(f"https://boatracecsv.github.io/data/previews/stt/{d}.csv")
+              sui_data = fetch_csv(f"https://boatracecsv.github.io/data/previews/sui/{d}.csv")
+              orig_data = fetch_csv(f"https://boatracecsv.github.io/data/previews/original_exhibition/{d}.csv")
 
-          print("\n=== PHASE 5-D PREVIEWS AUDIT REPORT ===")
-          print(json.dumps(results, indent=2, ensure_ascii=False))
+              audit_sources[d_tag]["title"] = len(t_data) - 1 if t_data else 0
+              audit_sources[d_tag]["cards"] = len(c_data) - 1 if c_data else 0
+              audit_sources[d_tag]["tkz"] = len(tkz_data) - 1 if tkz_data else 0
+              audit_sources[d_tag]["stt"] = len(stt_data) - 1 if stt_data else 0
+              audit_sources[d_tag]["sui"] = len(sui_data) - 1 if sui_data else 0
+              audit_sources[d_tag]["original_exhibition"] = len(orig_data) - 1 if orig_data else 0
+
+              if not t_data or not c_data:
+                  continue
+
+              t_h, t_rows = t_data[0], t_data[1:]
+              c_h, c_rows = c_data[0], c_data[1:]
+              t_dict = {r[0]: dict(zip(t_h, r)) for r in t_rows if r}
+              c_dict = {r[0]: dict(zip(c_h, r)) for r in c_rows if r}
+
+              tkz_dict = {r[0]: dict(zip(tkz_data[0], r)) for r in tkz_data[1:] if r} if tkz_data else {}
+              stt_dict = {r[0]: dict(zip(stt_data[0], r)) for r in stt_data[1:] if r} if stt_data else {}
+              sui_dict = {r[0]: dict(zip(sui_data[0], r)) for r in sui_data[1:] if r} if sui_data else {}
+
+              common_cols = ["レースコード", "レース日", "レース場コード", "レース回"]
+              t_unique = [c for c in t_h if c not in common_cols]
+
+              for rcode in sorted(c_dict.keys()):
+                  c_row = c_dict[rcode]
+                  t_row = t_dict.get(rcode, {})
+                  tkz_row = tkz_dict.get(rcode, {})
+                  stt_row = stt_dict.get(rcode, {})
+                  sui_row = sui_dict.get(rcode, {})
+
+                  # レース共通統合
+                  race_item = {col: c_row.get(col, "") for col in ["レースコード", "レース日", "レース場コード", "レース回"]}
+                  for col in t_unique:
+                      race_item[col] = t_row.get(col, "")
+                  
+                  # 水面気象統合 (sui)
+                  race_item["気温"] = sui_row.get("気温", "")
+                  race_item["水温"] = sui_row.get("水温", "")
+                  race_item["波高"] = sui_row.get("波高", "")
+                  race_item["風向"] = sui_row.get("風向", "")
+                  race_item["風速"] = sui_row.get("風速", "")
+                  race_item["天候"] = sui_row.get("天候", "")
+
+                  # 艇別情報統合
+                  boats = []
+                  for b in range(1, 7):
+                      p = f"艇{b}_"
+                      # 出走表
+                      reg_no = c_row.get(f"{p}登録番号", "")
+                      name = c_row.get(f"{p}選手名", "")
+                      rank = c_row.get(f"{p}級別", "")
+                      age = safe_float(c_row.get(f"{p}年齢", ""))
+                      branch = c_row.get(f"{p}支部", "")
+                      m_no = c_row.get(f"{p}モーター番号", "")
+                      b_no = c_row.get(f"{p}ボート番号", "")
+                      nat_w = safe_float(c_row.get(f"{p}全国勝率", ""))
+                      nat_2p = safe_float(c_row.get(f"{p}全国2連率", ""))
+                      loc_w = safe_float(c_row.get(f"{p}当地勝率", ""))
+                      loc_2p = safe_float(c_row.get(f"{p}当地2連率", ""))
+                      m_2p = safe_float(c_row.get(f"{p}モーター2連率", ""))
+                      b_2p = safe_float(c_row.get(f"{p}ボート2連率", ""))
+
+                      # 直前情報 (tkz)
+                      ex_time = safe_float(tkz_row.get(f"{p}展示タイム", ""))
+                      weight = safe_float(tkz_row.get(f"{p}体重(kg)", ""))
+                      tilt = safe_float(tkz_row.get(f"{p}チルト", ""))
+                      weight_adj = safe_float(tkz_row.get(f"{p}体重調整(kg)", ""))
+
+                      # スタート展示 (stt) - 該当艇の進入コースとSTを特定
+                      st_course = ""
+                      st_timing = ""
+                      if stt_row:
+                          for course_idx in range(1, 7):
+                              b_key = f"コース{course_idx}_艇番" if f"コース{course_idx}_艇番" in stt_row else f"進入{course_idx}_艇番"
+                              st_key = f"コース{course_idx}_ST" if f"コース{course_idx}_ST" in stt_row else f"進入{course_idx}_ST"
+                              if str(stt_row.get(b_key, "")).strip() == str(b):
+                                  st_course = course_idx
+                                  st_timing = stt_row.get(st_key, "")
+                                  break
+
+                      b_obj = {
+                          "レースコード": rcode,
+                          "艇番": b,
+                          "艇主キー": f"{rcode}_{b}",
+                          "選手登録番号": reg_no,
+                          "選手名": name,
+                          "現級別": rank,
+                          "年齢": age,
+                          "支部": branch,
+                          "モーター番号": m_no,
+                          "ボート番号": b_no,
+                          "全国勝率": nat_w,
+                          "全国2連率": nat_2p,
+                          "当地勝率": loc_w,
+                          "当地2連率": loc_2p,
+                          "モーター2連率": m_2p,
+                          "ボート2連率": b_2p,
+                          # 直前展示
+                          "展示タイム": ex_time,
+                          "確定体重": weight,
+                          "チルト": tilt,
+                          "体重調整": weight_adj,
+                          "展示進入コース": st_course,
+                          "展示ST": st_timing,
+                          # original_exhibition (保留)
+                          "周回タイム": "UNKNOWN",
+                          "まわり足タイム": "UNKNOWN",
+                          "直線タイム": "UNKNOWN"
+                      }
+                      boats.append(b_obj)
+
+                  # 相対計算 (全国勝率・展示タイム)
+                  valid_nw = [(b["全国勝率"], b["艇番"]) for b in boats if isinstance(b["全国勝率"], float)]
+                  valid_ex = [(b["展示タイム"], b["艇番"]) for b in boats if isinstance(b["展示タイム"], float)]
+
+                  nw_ranks, nw_diffs = {}, {}
+                  if len(valid_nw) == 6:
+                      mean_nw = round(sum(x[0] for x in valid_nw) / 6.0, 3)
+                      sorted_nw = sorted(valid_nw, key=lambda x: x[0], reverse=True)
+                      cur_r = 1
+                      for i in range(6):
+                          if i > 0 and sorted_nw[i][0] < sorted_nw[i-1][0]:
+                              cur_r = i + 1
+                          nw_ranks[sorted_nw[i][1]] = cur_r
+                          nw_diffs[sorted_nw[i][1]] = round(sorted_nw[i][0] - mean_nw, 3)
+
+                  ex_ranks, ex_diffs = {}, {}
+                  if len(valid_ex) == 6:
+                      mean_ex = round(sum(x[0] for x in valid_ex) / 6.0, 3)
+                      # タイムは昇順が上位
+                      sorted_ex = sorted(valid_ex, key=lambda x: x[0])
+                      cur_r = 1
+                      for i in range(6):
+                          if i > 0 and sorted_ex[i][0] > sorted_ex[i-1][0]:
+                              cur_r = i + 1
+                          ex_ranks[sorted_ex[i][1]] = cur_r
+                          ex_diffs[sorted_ex[i][1]] = round(sorted_ex[i][0] - mean_ex, 3)
+
+                  for b in boats:
+                      idx = b["艇番"]
+                      b["全国勝率_順位"] = nw_ranks.get(idx, "")
+                      b["全国勝率_平均差"] = nw_diffs.get(idx, "")
+                      b["展示タイム_順位"] = ex_ranks.get(idx, "")
+                      b["展示タイム_平均差"] = ex_diffs.get(idx, "")
+
+                  all_days_races.append({"race": race_item, "boats": boats})
+
+          # 3. CSV出力
+          race_rows = [x["race"] for x in all_days_races]
+          boat_rows = []
+          for x in all_days_races:
+              boat_rows.extend(x["boats"])
+
+          with open("dataset/common_race_dataset.csv", "w", encoding="utf-8-sig", newline="") as f:
+              w = csv.DictWriter(f, fieldnames=list(race_rows[0].keys()))
+              w.writeheader()
+              w.writerows(race_rows)
+
+          with open("dataset/common_boat_dataset.csv", "w", encoding="utf-8-sig", newline="") as f:
+              w = csv.DictWriter(f, fieldnames=list(boat_rows[0].keys()))
+              w.writeheader()
+              w.writerows(boat_rows)
+
+          # 4. 監査レポート
+          boat_keys = [b["艇主キー"] for b in boat_rows]
+          boat_dups = len(boat_keys) - len(set(boat_keys))
+          per_race_cnts = Counter(b["レースコード"] for b in boat_rows)
+          exact_6 = all(cnt == 6 for cnt in per_race_cnts.values())
+
+          audit_report = {
+              "total_races_merged": len(race_rows),
+              "total_boats_merged": len(boat_rows),
+              "exact_6_boats_per_race": exact_6,
+              "boat_primary_key_duplicates": boat_dups,
+              "source_file_counts": dict(audit_sources),
+              "dataset_files": [
+                  "dataset/common_race_dataset.csv",
+                  "dataset/common_boat_dataset.csv"
+              ],
+              "status": "PASS" if len(race_rows) == 432 and len(boat_rows) == 2592 and boat_dups == 0 and exact_6 else "STOP"
+          }
+
+          with open("audit_common/common_dataset_audit.json", "w", encoding="utf-8") as f:
+              json.dump(audit_report, f, ensure_ascii=False, indent=2)
+
+          print("\n=== UNIFIED COMMON DATASET AUDIT REPORT ===")
+          print(json.dumps(audit_report, indent=2, ensure_ascii=False))
           EOF
