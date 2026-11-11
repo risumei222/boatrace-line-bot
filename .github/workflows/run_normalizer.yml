@@ -3,14 +3,14 @@ on:
   workflow_dispatch:
 
 jobs:
-  run_unified_backtest:
+  audit_and_reconcile:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Build Dataset & Run Engine A and B Backtest
+      - name: Reconcile Engine A and Diagnose Engine B
         run: |
           python3 - << 'EOF'
           import urllib.request, csv, io, json, os
@@ -19,7 +19,7 @@ jobs:
           dates = ["2026/11/09", "2026/11/10", "2026/11/11"]
 
           def fetch_csv(url):
-              req = urllib.request.Request(url, headers={"User-Agent": "BR-BacktestPipeline"})
+              req = urllib.request.Request(url, headers={"User-Agent": "BR-Audit"})
               try:
                   with urllib.request.urlopen(req, timeout=15) as resp:
                       if resp.status == 200:
@@ -36,27 +36,14 @@ jobs:
               except ValueError:
                   return ""
 
-          # 1. 共通データセットの即時生成
+          # 1. 出走表・直前情報の統合読み込み
           races = {}
           boats_by_race = defaultdict(list)
-          results_data = {}
 
           for d in dates:
               t_data = fetch_csv(f"https://boatracecsv.github.io/data/programs/title/{d}.csv")
               c_data = fetch_csv(f"https://boatracecsv.github.io/data/programs/race_cards/{d}.csv")
               tkz_data = fetch_csv(f"https://boatracecsv.github.io/data/previews/tkz/{d}.csv")
-              stt_data = fetch_csv(f"https://boatracecsv.github.io/data/previews/stt/{d}.csv")
-              sui_data = fetch_csv(f"https://boatracecsv.github.io/data/previews/sui/{d}.csv")
-              res_data = fetch_csv(f"https://boatracecsv.github.io/data/results/{d}.csv")
-
-              if res_data:
-                  r_h, r_rows = res_data[0], res_data[1:]
-                  for r in r_rows:
-                      if r:
-                          row_dict = dict(zip(r_h, r))
-                          rc = row_dict.get("レースコード")
-                          if rc:
-                              results_data[rc] = row_dict
 
               if not t_data or not c_data:
                   continue
@@ -66,8 +53,6 @@ jobs:
               t_dict = {r[0]: dict(zip(t_h, r)) for r in t_rows if r}
               c_dict = {r[0]: dict(zip(c_h, r)) for r in c_rows if r}
               tkz_dict = {r[0]: dict(zip(tkz_data[0], r)) for r in tkz_data[1:] if r} if tkz_data else {}
-              stt_dict = {r[0]: dict(zip(stt_data[0], r)) for r in stt_data[1:] if r} if stt_data else {}
-              sui_dict = {r[0]: dict(zip(sui_data[0], r)) for r in sui_data[1:] if r} if sui_data else {}
 
               common_cols = ["レースコード", "レース日", "レース場コード", "レース回"]
               t_unique = [c for c in t_h if c not in common_cols]
@@ -76,20 +61,14 @@ jobs:
                   c_row = c_dict[rcode]
                   t_row = t_dict.get(rcode, {})
                   tkz_row = tkz_dict.get(rcode, {})
-                  stt_row = stt_dict.get(rcode, {})
-                  sui_row = sui_dict.get(rcode, {})
 
                   race_item = {col: c_row.get(col, "") for col in common_cols}
                   for col in t_unique:
                       race_item[col] = t_row.get(col, "")
-                  race_item["気温"] = sui_row.get("気温", "")
-                  race_item["風速"] = sui_row.get("風速", "")
-                  race_item["波高"] = sui_row.get("波高", "")
                   races[rcode] = race_item
 
                   for b in range(1, 7):
                       p = f"艇{b}_"
-                      # 過去走節間ST平均
                       st_vals = []
                       for d_idx in range(1, 4):
                           st_v = safe_float(c_row.get(f"{p}節D{d_idx}走1ST", ""))
@@ -109,51 +88,69 @@ jobs:
                       }
                       boats_by_race[rcode].append(b_obj)
 
-          print(f"データ統合完了: レース数={len(races)}, 結果取得レース数={len(results_data)}")
+          # 2. 結果CSVの複数パス自動走査・照合取得
+          result_url_candidates = [
+              "https://boatracecsv.github.io/data/results/{date}.csv",
+              "https://boatracecsv.github.io/data/results/results/{date}.csv",
+              "https://boatracecsv.github.io/data/payoff/{date}.csv",
+              "https://boatracecsv.github.io/data/results/payoff/{date}.csv",
+              "https://boatracecsv.github.io/data/programs/results/{date}.csv"
+          ]
 
-          # 2. エンジンA（堅実イン逃げ式）
+          confirmed_results = {}
+          result_probe_log = {}
+
+          for pat in result_url_candidates:
+              found_cnt = 0
+              for d in dates:
+                  url = pat.format(date=d)
+                  res_data = fetch_csv(url)
+                  if res_data:
+                      r_h, r_rows = res_data[0], res_data[1:]
+                      for r in r_rows:
+                          if r:
+                              row_dict = dict(zip(r_h, r))
+                              rc = row_dict.get("レースコード")
+                              if rc:
+                                  confirmed_results[rc] = row_dict
+                                  found_cnt += 1
+              result_probe_log[pat] = found_cnt
+              if found_cnt > 0:
+                  break
+
+          # 3. エンジンA（堅実イン逃げ式）の選定12レース抽出
           EXCLUDED_STADIUMS_SOLID = ["02", "03", "04"]
           def evaluate_engine_a(race_info, b_list):
               jcd = str(race_info.get("レース場コード", "")).zfill(2)
-              if jcd in EXCLUDED_STADIUMS_SOLID:
-                  return None, "イン受難水面"
-              
+              if jcd in EXCLUDED_STADIUMS_SOLID: return None
               r1 = next((b for b in b_list if str(b["艇番"]) == "1"), None)
               r2 = next((b for b in b_list if str(b["艇番"]) == "2"), None)
               r5 = next((b for b in b_list if str(b["艇番"]) == "5"), None)
               r6 = next((b for b in b_list if str(b["艇番"]) == "6"), None)
-
-              if not r1 or not r2 or not r5 or not r6:
-                  return None, "艇データ不足"
+              if not r1 or not r2 or not r5 or not r6: return None
 
               r1_w = r1["全国勝率"] if isinstance(r1["全国勝率"], float) else 0.0
               r2_w = r2["全国勝率"] if isinstance(r2["全国勝率"], float) else 0.0
               r5_w = r5["全国勝率"] if isinstance(r5["全国勝率"], float) else 0.0
               r6_w = r6["全国勝率"] if isinstance(r6["全国勝率"], float) else 0.0
 
-              if r1["現級別"] != "A1" or r1_w < 6.20:
-                  return None, "1号艇条件不一致"
-              if (r1_w - r2_w) < 0.80:
-                  return None, "2号艇との差不足"
-              if r5["現級別"] in ["A1", "A2"] or r6["現級別"] in ["A1", "A2"]:
-                  return None, "5・6号艇にA級存在"
-              if r5_w >= 5.20 or r6_w >= 5.20:
-                  return None, "5・6号艇勝率超過"
+              if r1["現級別"] != "A1" or r1_w < 6.20: return None
+              if (r1_w - r2_w) < 0.80: return None
+              if r5["現級別"] in ["A1", "A2"] or r6["現級別"] in ["A1", "A2"]: return None
+              if r5_w >= 5.20 or r6_w >= 5.20: return None
 
-              # 展開指数（2〜4号艇）
-              candidates = []
               inner_boats = [b for b in b_list if str(b["艇番"]) in ["2", "3", "4"]]
               st_list = [b["過去走平均ST_num"] for b in inner_boats if isinstance(b["過去走平均ST_num"], float)]
               min_st = min(st_list) if st_list else 0.20
 
+              candidates = []
               for b in inner_boats:
                   p = int(b["艇番"])
                   base_course = 3.0 if p == 2 else (2.0 if p == 3 else 1.0)
                   b_st = b["過去走平均ST_num"] if isinstance(b["過去走平均ST_num"], float) else 0.20
                   st_bonus = 1.5 if b_st == min_st else 0.0
                   w = b["全国勝率"] if isinstance(b["全国勝率"], float) else 0.0
-                  score = base_course + w + st_bonus
-                  candidates.append({"pit": p, "score": score})
+                  candidates.append({"pit": p, "score": base_course + w + st_bonus})
 
               candidates.sort(key=lambda x: x["score"], reverse=True)
               p_strong = candidates[0]["pit"]
@@ -168,28 +165,93 @@ jobs:
                   (f"1-{p_weak}-{p_strong}", 100),
                   (f"1-{p_weak}-{p_mid}", 100)
               ]
-              return {"logic": "A", "bets": bets, "total_cost": 1000}, "合格"
+              return {"bets": bets, "total_cost": 1000}
 
-          # 3. エンジンB（リースメイ式）
-          def evaluate_engine_b(race_info, b_list):
-              try:
-                  rno = int(race_info.get("レース回", 0))
-              except ValueError:
-                  return None, "レース番号不正"
+          a_selected_races = []
+          for rc, rinfo in races.items():
+              res_a = evaluate_engine_a(rinfo, boats_by_race[rc])
+              if res_a:
+                  a_selected_races.append({
+                      "race_code": rc,
+                      "stadium": rinfo.get("レース場", ""),
+                      "rno": rinfo.get("レース回", ""),
+                      "bets": res_a["bets"],
+                      "cost": res_a["total_cost"]
+                  })
 
-              title = race_info.get("タイトル", "") + race_info.get("レース名", "")
+          # 4. エンジンAの12レース結果照合
+          a_reconcile_results = []
+          total_cost = 0
+          total_return = 0
+          hits_count = 0
+
+          for item in a_selected_races:
+              rc = item["race_code"]
+              r_data = confirmed_results.get(rc)
+              total_cost += item["cost"]
+
+              actual_comb = ""
+              actual_pay = 0
+              if r_data:
+                  actual_comb = r_data.get("3連単_組番", r_data.get("組番", "")).replace(" ", "").strip()
+                  pay_raw = str(r_data.get("3連単_払戻金", r_data.get("払戻金", 0))).replace(",", "").replace("円", "").strip()
+                  try:
+                      actual_pay = int(pay_raw)
+                  except ValueError:
+                      actual_pay = 0
+
+              race_hit = False
+              race_ret = 0
+              for bet, amt in item["bets"]:
+                  if actual_comb and bet == actual_comb:
+                      race_hit = True
+                      race_ret = int(actual_pay * (amt / 100))
+
+              if race_hit:
+                  hits_count += 1
+                  total_return += race_ret
+
+              a_reconcile_results.append({
+                  "race_code": rc,
+                  "stadium": item["stadium"],
+                  "rno": item["rno"],
+                  "result_found": r_data is not None,
+                  "actual_comb": actual_comb,
+                  "actual_pay": actual_pay,
+                  "is_hit": race_hit,
+                  "payout": race_ret
+              })
+
+          # 5. エンジンBの0件ファネル分析（単独通過 vs 累積通過）
+          total_rcs = len(races)
+          f1_single, f2_single, f3_single, f4_single = 0, 0, 0, 0
+          f1_cum, f2_cum, f3_cum, f4_cum = 0, 0, 0, 0
+
+          # シミュレーション用改善バリアント
+          # Variant 1: 7R以降解禁
+          var1_hits = 0
+          # Variant 2: キーマン基準を A2以上 or 全国5.80以上 or 当地6.00以上に緩和
+          var2_hits = 0
+          # Variant 3: 7R以降 ＋ キーマン緩和（複合）
+          var3_hits = 0
+
+          for rc, rinfo in races.items():
+              b_list = boats_by_race[rc]
+              try: rno = int(rinfo.get("レース回", 0))
+              except ValueError: rno = 0
+              title = rinfo.get("タイトル", "") + rinfo.get("レース名", "")
               is_special = any(k in title for k in ["企画", "ドリーム", "準優勝", "優勝", "女子", "ヴィーナス"])
-              if rno < 9 and not is_special:
-                  return None, "前半一般戦除外"
 
+              # 単独条件チェック
+              c1 = (rno >= 9) or is_special
               r1 = next((b for b in b_list if str(b["艇番"]) == "1"), None)
-              if not r1:
-                  return None, "1号艇不足"
+              r1_rank = r1["現級別"] if r1 else ""
+              r1_w = r1["全国勝率"] if r1 and isinstance(r1["全国勝率"], float) else 0.0
 
-              r1_w = r1["全国勝率"] if isinstance(r1["全国勝率"], float) else 0.0
-              if r1["現級別"] != "A1" or r1_w < 6.80:
-                  return None, "1号艇信頼度不足"
+              c2 = (r1_rank == "A1")
+              c3 = (r1_w >= 6.80)
 
+              # キーマン評価
               outer_candidates = []
               for b in b_list:
                   if str(b["艇番"]) in ["4", "5", "6"]:
@@ -200,174 +262,68 @@ jobs:
                       outer_candidates.append({"pit": int(b["艇番"]), "rank": b["現級別"], "nw": nw, "lw": lw, "score": score})
 
               outer_candidates.sort(key=lambda x: x["score"], reverse=True)
-              keyman = outer_candidates[0]
+              top_k = outer_candidates[0] if outer_candidates else None
+              c4 = top_k and (top_k["rank"] == "A1" or top_k["nw"] >= 6.50 or top_k["lw"] >= 7.00)
 
-              if not (keyman["rank"] == "A1" or keyman["nw"] >= 6.50 or keyman["lw"] >= 7.00):
-                  return None, "キーマン実力不足"
+              if c1: f1_single += 1
+              if c2: f2_single += 1
+              if c3: f3_single += 1
+              if c4: f4_single += 1
 
-              k_pit = keyman["pit"]
-              other_pits = [p for p in [2, 3, 4, 5, 6] if p != k_pit]
+              # 累積ファネル
+              if c1:
+                  f1_cum += 1
+                  if c2:
+                      f2_cum += 1
+                      if c3:
+                          f3_cum += 1
+                          if c4:
+                              f4_cum += 1
 
-              bets = []
-              for p in other_pits:
-                  amt = 300 if p in [2, 3] else 200
-                  bets.append((f"1-{k_pit}-{p}", amt))
-                  bets.append((f"1-{p}-{k_pit}", amt))
+              # 改善案シミュレーション
+              c1_v1 = (rno >= 7) or is_special
+              c4_v2 = top_k and (top_k["rank"] in ["A1", "A2"] or top_k["nw"] >= 5.80 or top_k["lw"] >= 6.00)
 
-              inner_boats = [b for b in b_list if str(b["艇番"]) in ["2", "3", "4"]]
-              inner_sorted = sorted(inner_boats, key=lambda x: x["全国勝率"] if isinstance(x["全国勝率"], float) else 0.0, reverse=True)
-              best_inner = int(inner_sorted[0]["艇番"])
-
-              bets.append((f"{best_inner}-1-{k_pit}", 200))
-              bets.append((f"{best_inner}-{k_pit}-1", 200))
-
-              total = sum(b[1] for b in bets)
-              return {"logic": "B", "bets": bets, "total_cost": total}, "合格"
-
-          # 4. 払戻判定関数
-          def check_hit(rc, bet_str):
-              res = results_data.get(rc)
-              if not res:
-                  return 0, False
-              comb = res.get("3連単_組番", "").replace(" ", "").strip()
-              pay_raw = res.get("3連単_払戻金", "").replace(",", "").replace("円", "").strip()
-              if comb == bet_str:
-                  try:
-                      return int(pay_raw), True
-                  except ValueError:
-                      return 0, True
-              return 0, False
-
-          # 5. バックテスト集計ループ
-          stats_a = {"races": 0, "hits": 0, "cost": 0, "return": 0, "cur_loss": 0, "max_loss": 0}
-          stats_b = {"races": 0, "hits": 0, "cost": 0, "return": 0, "cur_loss": 0, "max_loss": 0}
-          cross = {"A_only": 0, "B_only": 0, "both": 0, "neither": 0}
-          by_stadium = defaultdict(lambda: {"A_races": 0, "A_hits": 0, "A_cost": 0, "A_return": 0, "B_races": 0, "B_hits": 0, "B_cost": 0, "B_return": 0})
-          by_rno = defaultdict(lambda: {"A_races": 0, "A_hits": 0, "A_cost": 0, "A_return": 0, "B_races": 0, "B_hits": 0, "B_cost": 0, "B_return": 0})
-
-          # 展示後モード（展示タイム6艇完備レース）
-          ex_ready_races = set()
-          for rc, b_list in boats_by_race.items():
-              valid_ex = [b for b in b_list if isinstance(b.get("展示タイム"), float)]
-              if len(valid_ex) == 6:
-                  ex_ready_races.add(rc)
-
-          stats_a_post = {"races": 0, "hits": 0, "cost": 0, "return": 0}
-          stats_b_post = {"races": 0, "hits": 0, "cost": 0, "return": 0}
-
-          for rc, rinfo in races.items():
-              b_list = boats_by_race[rc]
-              res_a, _ = evaluate_engine_a(rinfo, b_list)
-              res_b, _ = evaluate_engine_b(rinfo, b_list)
-
-              is_a = res_a is not None
-              is_b = res_b is not None
-
-              if is_a and not is_b: cross["A_only"] += 1
-              elif is_b and not is_a: cross["B_only"] += 1
-              elif is_a and is_b: cross["both"] += 1
-              else: cross["neither"] += 1
-
-              stad = rinfo.get("レース場", "不明")
-              rno = str(rinfo.get("レース回", "0"))
-
-              if is_a:
-                  stats_a["races"] += 1
-                  c = res_a["total_cost"]
-                  stats_a["cost"] += c
-                  by_stadium[stad]["A_races"] += 1
-                  by_stadium[stad]["A_cost"] += c
-                  by_rno[rno]["A_races"] += 1
-                  by_rno[rno]["A_cost"] += c
-
-                  ret = 0
-                  hit_flag = False
-                  for bet, amt in res_a["bets"]:
-                      pay, hit = check_hit(rc, bet)
-                      if hit:
-                          ret += int(pay * (amt / 100))
-                          hit_flag = True
-                  stats_a["return"] += ret
-                  by_stadium[stad]["A_return"] += ret
-                  by_rno[rno]["A_return"] += ret
-                  if hit_flag:
-                      stats_a["hits"] += 1
-                      by_stadium[stad]["A_hits"] += 1
-                      by_rno[rno]["A_hits"] += 1
-                      stats_a["cur_loss"] = 0
-                  else:
-                      stats_a["cur_loss"] += 1
-                      if stats_a["cur_loss"] > stats_a["max_loss"]:
-                          stats_a["max_loss"] = stats_a["cur_loss"]
-
-                  if rc in ex_ready_races:
-                      stats_a_post["races"] += 1
-                      stats_a_post["cost"] += c
-                      stats_a_post["return"] += ret
-                      if hit_flag: stats_a_post["hits"] += 1
-
-              if is_b:
-                  stats_b["races"] += 1
-                  c = res_b["total_cost"]
-                  stats_b["cost"] += c
-                  by_stadium[stad]["B_races"] += 1
-                  by_stadium[stad]["B_cost"] += c
-                  by_rno[rno]["B_races"] += 1
-                  by_rno[rno]["B_cost"] += c
-
-                  ret = 0
-                  hit_flag = False
-                  for bet, amt in res_b["bets"]:
-                      pay, hit = check_hit(rc, bet)
-                      if hit:
-                          ret += int(pay * (amt / 100))
-                          hit_flag = True
-                  stats_b["return"] += ret
-                  by_stadium[stad]["B_return"] += ret
-                  by_rno[rno]["B_return"] += ret
-                  if hit_flag:
-                      stats_b["hits"] += 1
-                      by_stadium[stad]["B_hits"] += 1
-                      by_rno[rno]["B_hits"] += 1
-                      stats_b["cur_loss"] = 0
-                  else:
-                      stats_b["cur_loss"] += 1
-                      if stats_b["cur_loss"] > stats_b["max_loss"]:
-                          stats_b["max_loss"] = stats_b["cur_loss"]
-
-                  if rc in ex_ready_races:
-                      stats_b_post["races"] += 1
-                      stats_b_post["cost"] += c
-                      stats_b_post["return"] += ret
-                      if hit_flag: stats_b_post["hits"] += 1
-
-          def format_stats(s):
-              r_cnt = s["races"]
-              h_cnt = s["hits"]
-              c = s["cost"]
-              ret = s["return"]
-              return {
-                  "該当レース数": r_cnt,
-                  "的中数": h_cnt,
-                  "的中率": f"{round(h_cnt / r_cnt * 100, 2)}%" if r_cnt else "0.0%",
-                  "購入総額": f"{c:,}円",
-                  "払戻総額": f"{ret:,}円",
-                  "回収率": f"{round(ret / c * 100, 2)}%" if c else "0.0%",
-                  "平均購入額": f"{round(c / r_cnt, 1)}円" if r_cnt else "0円",
-                  "最大連敗数": s.get("max_loss", 0)
-              }
+              if c1_v1 and c2 and c3 and c4: var1_hits += 1
+              if c1 and c2 and c3 and c4_v2: var2_hits += 1
+              if c1_v1 and c2 and c3 and c4_v2: var3_hits += 1
 
           report = {
-              "全検証対象レース数": len(races),
-              "結果データ取得レース数": len(results_data),
-              "エンジンA（堅実イン逃げ式）": format_stats(stats_a),
-              "エンジンB（リースメイ式）": format_stats(stats_b),
-              "重複該当分析": cross,
-              "展示後モード_準備完備レース数": len(ex_ready_races),
-              "展示後モード_エンジンA": format_stats(stats_a_post),
-              "展示後モード_エンジンB": format_stats(stats_b_post)
+              "result_path_probe": result_probe_log,
+              "results_available_total": len(confirmed_results),
+              "engine_a_reconciliation": {
+                  "selected_races": len(a_selected_races),
+                  "results_found": sum(1 for x in a_reconcile_results if x["result_found"]),
+                  "hits": hits_count,
+                  "hit_rate": f"{round(hits_count / len(a_selected_races) * 100, 2)}%" if a_selected_races else "0.0%",
+                  "total_cost": total_cost,
+                  "total_return": total_return,
+                  "recovery_rate": f"{round(total_return / total_cost * 100, 2)}%" if total_cost else "0.0%",
+                  "details": a_reconcile_results
+              },
+              "engine_b_funnel_diagnosis": {
+                  "total_races": total_rcs,
+                  "single_filter_pass": {
+                      "1_race_9_to_12_or_special": f1_single,
+                      "2_r1_is_A1": f2_single,
+                      "3_r1_win_rate_ge_6_80": f3_single,
+                      "4_outer_keyman_present": f4_single
+                  },
+                  "sequential_funnel_pass": {
+                      "step1_race_selection": f1_cum,
+                      "step2_and_r1_A1": f2_cum,
+                      "step3_and_r1_win_6_80": f3_cum,
+                      "step4_and_keyman_present_FINAL": f4_cum
+                  }
+              },
+              "engine_b_improvement_simulations": {
+                  "original_v1_0": f4_cum,
+                  "variant_1_expand_to_7R": var1_hits,
+                  "variant_2_relax_keyman_criteria": var2_hits,
+                  "variant_3_expand_7R_and_relax_keyman": var3_hits
+              }
           }
 
-          print("\n=== INITIAL 432-RACES BACKTEST REPORT ===")
+          print("\n=== ENGINE A RECONCILIATION & ENGINE B DIAGNOSIS REPORT ===")
           print(json.dumps(report, indent=2, ensure_ascii=False))
           EOF
