@@ -4,58 +4,58 @@ on:
   workflow_dispatch:
 
 jobs:
-  run-audit-test:
+  inspect-data:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: |
-          pip install lhafile urllib3
+        run: pip install lhafile urllib3
 
-      - name: Inspect K-File Header Format
+      - name: Fetch Real Racer Rows L028 to L060
         run: |
           python - << 'EOF'
           import urllib.request
           import lhafile
-          import re
+          import hashlib
 
-          target_dates = [("2026-11-10", "261110"), ("2025-11-12", "251112")]
+          targets = [
+              ("2026-11-10", "k261110.lzh", "https://www1.mbrace.or.jp/od2/K/202611/k261110.lzh"),
+              ("2025-11-12", "k251112.lzh", "https://www1.mbrace.or.jp/od2/K/202511/k251112.lzh")
+          ]
 
-          for f_date, yymmdd in target_dates:
-              lzh_name = f"k{yymmdd}.lzh"
-              url = f"https://www1.mbrace.or.jp/od2/K/20{yymmdd[:4]}/k{yymmdd}.lzh"
-              print(f"\n==================== {f_date} ({lzh_name}) ====================")
-              urllib.request.urlretrieve(url, lzh_path := f"/tmp/{lzh_name}")
-              lf = lhafile.Lhafile(lzh_path)
+          for target_date, lzh_name, url in targets:
+              print(f"\n==================== {target_date} ({lzh_name}) ====================")
+              save_path = f"/tmp/{lzh_name}"
+              urllib.request.urlretrieve(url, save_path)
+              
+              with open(save_path, 'rb') as fp:
+                  lzh_bytes = fp.read()
+              sha = hashlib.sha256(lzh_bytes).hexdigest()
+              print(f"SOURCE URL : {url}")
+              print(f"LZH SHA-256: {sha}")
+
+              lf = lhafile.Lhafile(save_path)
+              txt_name = None
               raw_bytes = None
               for info in lf.infolist():
                   if info.filename.lower().endswith('.txt'):
+                      txt_name = info.filename
                       raw_bytes = lf.read(info.filename)
                       break
-              
+
+              print(f"TXT FILE   : {txt_name} ({len(raw_bytes)} bytes)")
               lines = raw_bytes.splitlines()
-              print(f"Total Lines: {len(lines)}")
-              
-              print("\n--- FIRST 35 LINES SAMPLE ---")
-              for i in range(min(35, len(lines))):
+
+              print("\n--- LINES 28 TO 60 (1R HEADER, RACERS, PAYOUTS, 2R) ---")
+              for i in range(27, min(60, len(lines))):
                   lb = lines[i]
                   text = lb.decode('cp932', errors='replace')
-                  if any(keyword in text for keyword in ["R", "桐生", "戸田", "競走成績", "ボート"]):
-                      print(f"L{i+1:03d} (len={len(lb):02d}): {text}")
-                      if "1R" in text or "01#" in text or "桐生" in text:
-                          print(f"     HEX: {lb[:40].hex()}")
+                  print(f"L{i+1:03d} (len={len(lb):02d}): {text}")
+                  print(f"      HEX: {lb.hex()}")
 
-              # ヘッダー候補行のカウント
-              r_pattern_count = sum(1 for l in lines if re.search(r'\d{1,2}R', l.decode('cp932', errors='ignore')))
-              venue_pattern_count = sum(1 for l in lines if re.search(r'\d{2}#', l.decode('cp932', errors='ignore')))
-              print(f"\nHeader Counts -> Lines with '..R': {r_pattern_count}, Lines with '..#': {venue_pattern_count}")
-
-          print("\n=== INSPECTION COMPLETED ===")
+          print("\n=== FINISHED ===")
           EOF
