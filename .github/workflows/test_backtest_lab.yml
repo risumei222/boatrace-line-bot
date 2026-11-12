@@ -4,58 +4,115 @@ on:
   workflow_dispatch:
 
 jobs:
-  inspect-data:
+  verify-k-parser:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout test/backtest-lab
+        uses: actions/checkout@v4
+        with:
+          ref: test/backtest-lab
+          fetch-depth: 0
+
+      - name: Safety Check
+        run: |
+          echo "=== 1. BRANCH & HEAD ==="
+          BRANCH=$(git branch --show-current)
+          echo "CURRENT_BRANCH: $BRANCH"
+          echo "HEAD_COMMIT: $(git rev-parse HEAD)"
+          git branch -a | grep "test/backtest-lab"
+          if [ "$BRANCH" != "test/backtest-lab" ]; then
+            echo "ABORT: Not on test/backtest-lab"
+            exit 1
+          fi
+          echo "=== 2. WORKFLOW TRIGGERS ==="
+          grep -rn "on:" .github/workflows/ -A 3
+          echo "=== 3. DIFF AGAINST MAIN ==="
+          git fetch origin main
+          git diff --name-status origin/main...HEAD
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install lhafile urllib3
+        run: pip install lhafile
 
-      - name: Fetch Real Racer Rows L028 to L060
+      - name: Run Unit Tests
+        run: python -m unittest -v backtest_lab/test_k_parser.py
+
+      - name: Run Real Data Verification and Full Audit
         run: |
           python - << 'EOF'
           import urllib.request
           import lhafile
           import hashlib
+          import json
+          import re
+          from collections import Counter
+          from backtest_lab.parse_k import parse_k_bytes, RACE_HEADER_RE, decode_cp932
 
           targets = [
-              ("2026-11-10", "k261110.lzh", "https://www1.mbrace.or.jp/od2/K/202611/k261110.lzh"),
-              ("2025-11-12", "k251112.lzh", "https://www1.mbrace.or.jp/od2/K/202511/k251112.lzh")
+              ("2026-11-10", "k261110.lzh", "https://www1.mbrace.or.jp/od2/K/202611/k261110.lzh", "888cd68f92b1a9f24bdb8ff05f9a16f215d2d5fd640b6d813334f4547296c418", "22", "福岡"),
+              ("2025-11-12", "k251112.lzh", "https://www1.mbrace.or.jp/od2/K/202511/k251112.lzh", "73d38e35af1305d13e73c3094b8888a8f391050c8ee88b743306dc09eddc904f", "21", "芦屋"),
           ]
 
-          for target_date, lzh_name, url in targets:
-              print(f"\n==================== {target_date} ({lzh_name}) ====================")
-              save_path = f"/tmp/{lzh_name}"
-              urllib.request.urlretrieve(url, save_path)
-              
-              with open(save_path, 'rb') as fp:
-                  lzh_bytes = fp.read()
-              sha = hashlib.sha256(lzh_bytes).hexdigest()
-              print(f"SOURCE URL : {url}")
-              print(f"LZH SHA-256: {sha}")
+          for dt, fname, url, expected_sha, vcode, vname in targets:
+              print(f"\n==================== {dt} ({fname}) ====================")
+              path = f"/tmp/{fname}"
+              urllib.request.urlretrieve(url, path)
+              with open(path, "rb") as f:
+                  actual_sha = hashlib.sha256(f.read()).hexdigest()
+              print(f"EXPECTED_SHA256: {expected_sha}")
+              print(f"ACTUAL_SHA256  : {actual_sha}")
+              print(f"SHA256_MATCH   : {expected_sha == actual_sha}")
 
-              lf = lhafile.Lhafile(save_path)
-              txt_name = None
-              raw_bytes = None
+              lf = lhafile.Lhafile(path)
+              raw = None
               for info in lf.infolist():
-                  if info.filename.lower().endswith('.txt'):
-                      txt_name = info.filename
-                      raw_bytes = lf.read(info.filename)
+                  if info.filename.lower().endswith(".txt"):
+                      raw = lf.read(info.filename)
                       break
 
-              print(f"TXT FILE   : {txt_name} ({len(raw_bytes)} bytes)")
-              lines = raw_bytes.splitlines()
+              res = parse_k_bytes(raw)
+              races = res["races"]
+              anomalies = res["anomalies"]
 
-              print("\n--- LINES 28 TO 60 (1R HEADER, RACERS, PAYOUTS, 2R) ---")
-              for i in range(27, min(60, len(lines))):
-                  lb = lines[i]
-                  text = lb.decode('cp932', errors='replace')
-                  print(f"L{i+1:03d} (len={len(lb):02d}): {text}")
-                  print(f"      HEX: {lb.hex()}")
+              # 全ファイル監査集計
+              total_racers = sum(r["racerCount"] for r in races)
+              racer_count_dist = dict(Counter(r["racerCount"] for r in races))
+              not_six = [r for r in races if not r["sixRacerRows"]]
+              dup_boats = [r for r in races if r["duplicateBoatNos"]]
+              unknown_venues = [a for a in anomalies if a["type"] == "UNKNOWN_OR_INVALID_VENUE"]
+              all_other = [ol for r in races for ol in r["otherLines"]]
 
-          print("\n=== FINISHED ===")
+              # レースヘッダー未認識の可能性チェック（H1800m等の距離表記を含むのにRACE_HEADER_REに不一致の行）
+              missed_headers = []
+              for idx, line in enumerate(raw.splitlines(), 1):
+                  if re.search(rb"\b\d{1,2}R\b", line) and re.search(rb"H\d+m", line, re.IGNORECASE):
+                      if not RACE_HEADER_RE.match(line):
+                          missed_headers.append((idx, decode_cp932(line).strip()))
+
+              print(f"SOURCE_LINES          : {res['sourceLineCount']}")
+              print(f"DETAIL_RACE_HEADERS   : {res['raceCount']}")
+              print(f"TOTAL_RACER_ROWS      : {total_racers}")
+              print(f"RACER_COUNT_PER_RACE  : {racer_count_dist}")
+              print(f"NOT_SIX_RACERS_COUNT  : {len(not_six)}")
+              print(f"DUPLICATE_BOAT_COUNT  : {len(dup_boats)}")
+              print(f"UNKNOWN_VENUE_COUNT   : {len(unknown_venues)}")
+              print(f"MISSED_HEADER_COUNT   : {len(missed_headers)}")
+              if missed_headers:
+                  print("MISSED_HEADER_SAMPLES :", missed_headers[:5])
+              print(f"OTHER_LINES_COUNT     : {len(all_other)}")
+              print("OTHER_LINES_SAMPLES   :", json.dumps(all_other[:5], ensure_ascii=False))
+              print(f"ANOMALY_COUNT         : {res['anomalyCount']}")
+              print("ANOMALIES_ALL         :", json.dumps(anomalies, ensure_ascii=False))
+
+              # 指定対象レース（1R・2R）の全項目出力
+              target_races = [r for r in races if r["venueCode"] == vcode and r["raceNo"] in (1, 2)]
+              for r in target_races:
+                  print(f"\n--- {dt} {r['venue']}({r['venueCode']}) {r['raceNo']}R | raceId={r['raceId']} | racerCount={r['racerCount']} | otherLines={len(r['otherLines'])} ---")
+                  for rc in r["racers"]:
+                      out = {k: v for k, v in rc.items() if k != "rawHex"}
+                      print(json.dumps(out, ensure_ascii=False))
           EOF
