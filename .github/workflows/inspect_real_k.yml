@@ -1,0 +1,82 @@
+name: Inspect Real K File Data
+
+on:
+  workflow_dispatch:
+
+jobs:
+  inspect-data:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install lhafile urllib3
+
+      - name: Fetch and Dump Real Racer Rows
+        run: |
+          python - << 'EOF'
+          import urllib.request
+          import lhafile
+          import hashlib
+
+          targets = [
+              ("2026-11-10", "k261110.lzh", "https://www1.mbrace.or.jp/od2/K/202611/k261110.lzh"),
+              ("2025-11-12", "k251112.lzh", "https://www1.mbrace.or.jp/od2/K/202511/k251112.lzh")
+          ]
+
+          for target_date, lzh_name, url in targets:
+              print(f"\n{'='*25} {target_date} ({lzh_name}) {'='*25}")
+              save_path = f"/tmp/{lzh_name}"
+              urllib.request.urlretrieve(url, save_path)
+              
+              with open(save_path, 'rb') as fp:
+                  lzh_bytes = fp.read()
+              sha = hashlib.sha256(lzh_bytes).hexdigest()
+              print(f"SOURCE URL: {url}")
+              print(f"LZH SHA-256: {sha}")
+
+              lf = lhafile.Lhafile(save_path)
+              txt_name = None
+              raw_bytes = None
+              for info in lf.infolist():
+                  if info.filename.lower().endswith('.txt'):
+                      txt_name = info.filename
+                      raw_bytes = lf.read(info.filename)
+                      break
+
+              print(f"EXTRACTED FILE: {txt_name} (Bytes: {len(raw_bytes)})")
+              lines = raw_bytes.splitlines()
+
+              # 詳細ヘッダー（1800m表記を含む1R・2R）と直後6行の選手行を生ダンプ
+              current_race = 0
+              for idx, lb in enumerate(lines, 1):
+                  try:
+                      text = lb.decode('cp932')
+                  except:
+                      text = lb.decode('cp932', errors='replace')
+
+                  if ("1800m" in text or "H1800m" in text) and ("1R" in text or "2R" in text):
+                      if "1R" in text: current_race = 1
+                      elif "2R" in text: current_race = 2
+                      
+                      print(f"\n--- [RACE {current_race} HEADER] Line {idx:04d} (len={len(lb)}) ---")
+                      print(f"TEXT: {text}")
+                      print(f"HEX : {lb.hex()}")
+
+                      print(f"--- [RACE {current_race} RACER ROWS (Next 6 Lines)] ---")
+                      for offset in range(1, 7):
+                          r_idx = idx + offset
+                          if r_idx - 1 < len(lines):
+                              r_lb = lines[r_idx - 1]
+                              r_text = r_lb.decode('cp932', errors='replace')
+                              print(f"L{r_idx:04d} (len={len(r_lb):02d}): {r_text}")
+                              print(f"      HEX: {r_lb.hex()}")
+
+                      if current_race == 2:
+                          break
+
+          print("\n=== DUMP COMPLETED SUCCESSFULLY ===")
+          EOF
