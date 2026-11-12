@@ -2,7 +2,7 @@ import copy, json
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-BACKTEST_RUNNER_VERSION = "1.0.0"
+BACKTEST_RUNNER_VERSION = "1.1.0"
 DEFAULT_UNIT_STAKE_YEN = 100
 PredictionEngineFn = Callable[[Dict[str, Any]], Dict[str, Any]]
 
@@ -27,15 +27,48 @@ def get_default_stub_engines() -> List[EngineSpec]:
         for eid in ("A", "B", "C", "D")
     ]
 
+def _normalize_sanrentan_payouts(sanrentan: Any) -> Dict[str, int]:
+    """
+    Normalize sanrentan into {combination: payout}.
+    Official parse_k_results.py output is a single dict; list is also supported safely.
+    Never imputes None, malformed combinations, or invalid/negative payouts.
+    """
+    if sanrentan is None:
+        return {}
+    if isinstance(sanrentan, dict):
+        items = [sanrentan]
+    elif isinstance(sanrentan, list):
+        items = sanrentan
+    else:
+        return {}
+    pmap: Dict[str, int] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            return {}
+        comb = item.get("combination")
+        pay = item.get("payout")
+        if not isinstance(comb, str) or not comb:
+            return {}
+        parts = comb.split("-")
+        if len(parts) != 3 or not all(p.isdigit() for p in parts):
+            return {}
+        if isinstance(pay, bool) or not isinstance(pay, int) or pay < 0:
+            return {}
+        pmap[comb] = pay
+    return pmap
+
 def _is_normally_evaluable(ev: Dict[str, Any]) -> bool:
     if not isinstance(ev, dict) or ev.get("resultStatus") != "NORMAL":
         return False
-    if ev.get("hasAbnormal") is True or ev.get("refundBoatNos") or ev.get("k0BoatNos") or ev.get("abnormalEntries"):
+    if ev.get("hasAbnormal") is not False:
         return False
-    s = ev.get("sanrentan")
-    return isinstance(s, list) and len(s) > 0
+    if ev.get("refundBoatNos") or ev.get("k0BoatNos") or ev.get("abnormalEntries"):
+        return False
+    return len(_normalize_sanrentan_payouts(ev.get("sanrentan"))) > 0
 
 def _validate_comb(comb: str) -> None:
+    if not isinstance(comb, str):
+        raise BacktestIntegrityError(f"Invalid combination type: {type(comb).__name__}")
     p = comb.split("-")
     if len(p) != 3 or not all(x.isdigit() for x in p):
         raise BacktestIntegrityError(f"Invalid combination: {comb}")
@@ -70,14 +103,14 @@ def evaluate_single_engine(dataset: Dict[str, Any], engine: EngineSpec, *, unit_
             logs.append({"raceId": rid, "evaluable": False, "action": "EXCLUDED_ABNORMAL_OR_REFUND", "betCount": len(bets), "hitCount": 0, "stake": 0, "payout": 0})
             continue
         bet_races += 1
-        pmap = {x["combination"]: x["payout"] for x in (ev.get("sanrentan") or []) if isinstance(x.get("combination"), str) and isinstance(x.get("payout"), int)}
+        pmap = _normalize_sanrentan_payouts(ev.get("sanrentan"))
         r_stake = r_pay = r_hits = 0
         for b in bets:
             if not isinstance(b, dict) or "combination" not in b:
                 raise BacktestIntegrityError(f"Invalid bet on {rid}")
             _validate_comb(b["combination"])
             st = b.get("stake", unit_stake_yen)
-            if not isinstance(st, int) or st <= 0:
+            if isinstance(st, bool) or not isinstance(st, int) or st <= 0:
                 raise BacktestIntegrityError(f"Invalid stake on {rid}")
             bet_cnt += 1
             r_stake += st
