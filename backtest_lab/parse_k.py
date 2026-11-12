@@ -19,9 +19,13 @@ VENUE_CODES = {
 VENUE_HEADER_RE = re.compile(
     r"^\s*第\s*\d+日\s+(\d{4}/\d{2}/\d{2})\s+ボートレース(.+?)\s*$"
 )
+
+# H1800m・H1200mなど、距離を限定せず認識する
 RACE_HEADER_RE = re.compile(
-    rb"^\s*(\d{1,2})R\b.*H1800m", re.IGNORECASE
+    rb"^\s*(\d{1,2})R\b.*H\d+m(?:\s|$)",
+    re.IGNORECASE,
 )
+
 ASCII_DIGITS_RE = re.compile(rb"^\d+$")
 DECIMAL_RE = re.compile(r"^\d+\.\d+$")
 
@@ -36,8 +40,10 @@ def normalize_venue_name(value: str) -> str:
 
 def parse_decimal(raw: str) -> float | None:
     value = raw.strip()
+
     if not DECIMAL_RE.fullmatch(value):
         return None
+
     try:
         return float(value)
     except ValueError:
@@ -74,7 +80,7 @@ def parse_venue_header(line: bytes) -> dict[str, Any] | None:
 
 def parse_racer_row(
     line: bytes,
-    line_number: int | None = None
+    line_number: int | None = None,
 ) -> dict[str, Any] | None:
 
     if len(line) < 66:
@@ -94,19 +100,42 @@ def parse_racer_row(
     if not ASCII_DIGITS_RE.fullmatch(racer_no_raw):
         return None
 
-    if course_raw not in (b"1", b"2", b"3", b"4", b"5", b"6"):
+    # 進入コースが空欄でも選手行として保持する
+    course_value = course_raw.strip()
+
+    if course_value in (b"1", b"2", b"3", b"4", b"5", b"6"):
+        entry_course = int(course_value)
+    elif course_value == b"":
+        entry_course = None
+    else:
         return None
 
     name = decode_cp932(line[13:29])
     name = name.replace("\u3000", " ").strip()
 
-    motor_raw = line[30:32].decode("ascii", errors="replace").strip()
-    equipment_raw = line[34:37].decode("ascii", errors="replace").strip()
-    exhibition_raw = line[39:43].decode("ascii", errors="replace").strip()
-    st_raw = line[51:55].decode("ascii", errors="replace").strip()
-    race_time_raw = line[60:66].decode("ascii", errors="replace").strip()
+    motor_raw = line[30:32].decode(
+        "ascii", errors="replace"
+    ).strip()
 
-    rank_text = rank_raw.decode("ascii", errors="replace")
+    equipment_raw = line[34:37].decode(
+        "ascii", errors="replace"
+    ).strip()
+
+    exhibition_raw = line[39:43].decode(
+        "ascii", errors="replace"
+    ).strip()
+
+    st_raw = line[51:55].decode(
+        "ascii", errors="replace"
+    ).strip()
+
+    race_time_raw = line[60:66].decode(
+        "ascii", errors="replace"
+    ).strip()
+
+    rank_text = rank_raw.decode(
+        "ascii", errors="replace"
+    )
 
     return {
         "lineNumber": line_number,
@@ -119,7 +148,8 @@ def parse_racer_row(
         "boatEquipmentNoRaw": equipment_raw,
         "exhibitionTimeRaw": exhibition_raw,
         "exhibitionTime": parse_decimal(exhibition_raw),
-        "entryCourse": int(course_raw),
+        "entryCourse": entry_course,
+        "entryCourseRaw": decode_cp932(course_raw),
         "stRaw": st_raw,
         "st": parse_decimal(st_raw),
         "raceTimeRaw": race_time_raw,
@@ -142,15 +172,31 @@ def parse_k_bytes(raw_bytes: bytes) -> dict[str, Any]:
         if current_race is None:
             return
 
-        current_race["racerCount"] = len(current_race["racers"])
-
-        slots = [r["boatNo"] for r in current_race["racers"]]
-        current_race["duplicateBoatNos"] = sorted(
-            {slot for slot in slots if slots.count(slot) > 1}
+        current_race["racerCount"] = len(
+            current_race["racers"]
         )
+
+        slots = [
+            racer["boatNo"]
+            for racer in current_race["racers"]
+        ]
+
+        current_race["duplicateBoatNos"] = sorted({
+            slot for slot in slots if slots.count(slot) > 1
+        })
 
         current_race["sixRacerRows"] = (
             len(current_race["racers"]) == 6
+        )
+
+        unknown_courses = [
+            racer["boatNo"]
+            for racer in current_race["racers"]
+            if racer["entryCourse"] is None
+        ]
+
+        current_race["unknownEntryCourseBoatNos"] = (
+            unknown_courses
         )
 
         if current_race["racerCount"] != 6:
@@ -165,6 +211,13 @@ def parse_k_bytes(raw_bytes: bytes) -> dict[str, Any]:
                 "type": "DUPLICATE_BOAT_NO",
                 "raceId": current_race["raceId"],
                 "boatNos": current_race["duplicateBoatNos"],
+            })
+
+        if unknown_courses:
+            anomalies.append({
+                "type": "UNKNOWN_ENTRY_COURSE",
+                "raceId": current_race["raceId"],
+                "boatNos": unknown_courses,
             })
 
         races.append(current_race)
@@ -186,6 +239,7 @@ def parse_k_bytes(raw_bytes: bytes) -> dict[str, Any]:
                     "venue": venue["venue"],
                     "dateRaw": venue["dateRaw"],
                 })
+
             continue
 
         race_match = RACE_HEADER_RE.match(line)
@@ -199,10 +253,12 @@ def parse_k_bytes(raw_bytes: bytes) -> dict[str, Any]:
                 current_venue["raceDate"]
                 if current_venue else None
             )
+
             venue_code = (
                 current_venue["venueCode"]
                 if current_venue else None
             )
+
             venue_name = (
                 current_venue["venue"]
                 if current_venue else None
@@ -242,6 +298,7 @@ def parse_k_bytes(raw_bytes: bytes) -> dict[str, Any]:
 
             if racer is not None:
                 current_race["racers"].append(racer)
+
             elif line.strip():
                 current_race["otherLines"].append({
                     "lineNumber": line_number,
@@ -252,7 +309,7 @@ def parse_k_bytes(raw_bytes: bytes) -> dict[str, Any]:
     finish_race()
 
     return {
-        "parserVersion": "1.0.0",
+        "parserVersion": "1.1.0",
         "encoding": "CP932",
         "sourceLineCount": len(lines),
         "raceCount": len(races),
@@ -264,7 +321,7 @@ def parse_k_bytes(raw_bytes: bytes) -> dict[str, Any]:
 
 def parse_k_file(
     input_path: str | Path,
-    output_path: str | Path
+    output_path: str | Path,
 ) -> dict[str, Any]:
 
     input_path = Path(input_path)
@@ -272,10 +329,17 @@ def parse_k_file(
 
     result = parse_k_bytes(input_path.read_bytes())
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     output_path.write_text(
-        json.dumps(result, ensure_ascii=False, indent=2),
+        json.dumps(
+            result,
+            ensure_ascii=False,
+            indent=2,
+        ),
         encoding="utf-8",
     )
 
