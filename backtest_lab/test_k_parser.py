@@ -28,7 +28,7 @@ def make_racer_row(
 
     # 16バイトの選手名欄
     row[13:29] = "テスト選手".encode("cp932").ljust(
-        16, b"\x81\x40"
+        16, b" "
     )
 
     row[30:32] = b" 1"
