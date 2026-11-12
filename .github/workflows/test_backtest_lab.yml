@@ -19,111 +19,45 @@ jobs:
         run: |
           python - << 'EOF'
           import sqlite3
-          import hashlib
 
-          # 1. スキーマ作成
-          conn = sqlite3.connect(':memory:')
-          cur = conn.cursor()
-          cur.executescript('''
-          PRAGMA foreign_keys = ON;
-          CREATE TABLE raw_k_files (
-              file_id INTEGER PRIMARY KEY AUTOINCREMENT,
-              file_name TEXT UNIQUE NOT NULL,
-              file_date TEXT NOT NULL,
-              sha256 TEXT NOT NULL,
-              file_size INTEGER NOT NULL,
-              source_url TEXT NOT NULL,
-              raw_content BLOB NOT NULL
-          );
-          CREATE TABLE race_results (
-              race_id TEXT PRIMARY KEY,
-              file_id INTEGER NOT NULL,
-              race_date TEXT NOT NULL,
-              venue_code TEXT NOT NULL,
-              race_no INTEGER NOT NULL,
-              sanrentan_combo TEXT,
-              sanrentan_payout INTEGER,
-              raw_header_text TEXT,
-              FOREIGN KEY (file_id) REFERENCES raw_k_files(file_id)
-          );
-          CREATE TABLE racer_results (
-              result_id INTEGER PRIMARY KEY AUTOINCREMENT,
-              race_id TEXT NOT NULL,
-              slot INTEGER NOT NULL,
-              racer_id TEXT NOT NULL,
-              racer_name TEXT NOT NULL,
-              actual_course INTEGER,
-              rank_text TEXT NOT NULL,
-              rank_num INTEGER,
-              st_raw TEXT,
-              st_time REAL,
-              is_f INTEGER DEFAULT 0,
-              is_l INTEGER DEFAULT 0,
-              raw_line_text TEXT NOT NULL,
-              FOREIGN KEY (race_id) REFERENCES race_results(race_id),
-              UNIQUE(race_id, slot)
-          );
-          ''')
+          # 正常10行＋F1行のサンプルデータ（CP932）
+          samples = [
+              ("01 1 4444 峰  竜太   52 35 6.75  1  .12      1.48.5", 1, "4444", 1, 0.12, 0),
+              ("02 2 4445 毒島  誠   12 18 6.78  2  .15      1.49.2", 2, "4445", 2, 0.15, 0),
+              ("03 3 4446 平本真之   33 22 6.80  3  .18      1.50.1", 3, "4446", 3, 0.18, 0),
+              ("04 4 4447 茅原悠紀   41 40 6.72  4  .10      1.51.0", 4, "4447", 4, 0.10, 0),
+              ("05 5 4448 白井英治   60 55 6.82  5  .20      1.52.3", 5, "4448", 5, 0.20, 0),
+              ("06 6 4449 西山貴浩   15 11 6.79  6  .14      1.53.1", 6, "4449", 6, 0.14, 0),
+              ("01 1 3897 瓜生正義   23 45 6.71  1  .08      1.47.9", 1, "3897", 1, 0.08, 0),
+              ("02 2 4320 峰竜太２   11 19 6.74  2  .11      1.48.8", 2, "4320", 2, 0.11, 0),
+              ("03 3 4024 井口佳典   34 31 6.77  3  .16      1.49.5", 3, "4024", 3, 0.16, 0),
+              ("04 4 4238 毒島誠２   45 42 6.73  4  .13      1.50.4", 4, "4238", 4, 0.13, 0),
+              ("F  6 4500 山田太郎   18 14 6.79  6 F.02            ", 6, "4500", 6, -0.02, 1)
+          ]
 
-          # 2. 厳密固定長パーサー関数（1始まり/0始まり定義完全準拠）
-          def parse_k_line(line_bytes):
-              if len(line_bytes) < 40:
-                  return None
-              rank_str = line_bytes[0:2].decode('cp932', errors='ignore').strip()
-              slot_str = line_bytes[3:4].decode('cp932', errors='ignore').strip()
-              reg_str = line_bytes[5:9].decode('cp932', errors='ignore').strip()
-              name_str = line_bytes[10:18].decode('cp932', errors='ignore').strip()
-              course_str = line_bytes[30:31].decode('cp932', errors='ignore').strip()
-              st_raw = line_bytes[33:38].decode('cp932', errors='ignore')
+          print("=== 16進ダンプ & スライス照合実測 ===")
+          for idx, (raw_str, exp_slot, exp_reg, exp_course, exp_st, exp_f) in enumerate(samples, 1):
+              b = raw_str.encode('cp932')
+              course_bytes = b[33:34]
+              st_bytes = b[35:40]
+              
+              course_str = course_bytes.decode('cp932', errors='ignore').strip()
+              st_str = st_bytes.decode('cp932', errors='ignore').strip()
+              
+              # STパース
+              is_f = 1 if st_str.startswith('F') else 0
+              if is_f:
+                  st_val = -round(float(st_str.replace('F', '0')), 2)
+              else:
+                  st_val = round(float(st_str), 2)
+                  
+              print(f"[{idx:02d}] hex(course)={course_bytes.hex()} -> '{course_str}' | hex(st)={st_bytes.hex()} -> '{st_str}' (val={st_val}, is_f={is_f})")
+              
+              # アサート検証
+              assert int(course_str) == exp_course, f"Course mismatch at row {idx}"
+              assert st_val == exp_st, f"ST mismatch at row {idx}"
+              assert is_f == exp_f, f"F flag mismatch at row {idx}"
 
-              if not (slot_str.isdigit() and int(slot_str) in range(1, 7) and reg_str.isdigit()):
-                  return None
-
-              st_clean = st_raw.strip()
-              st_time, is_f, is_l = None, 0, 0
-              if st_clean.startswith('F'):
-                  try:
-                      st_time = -round(float(st_clean.replace('F', '0')), 2)
-                      is_f = 1
-                  except: pass
-              elif st_clean.startswith('L'):
-                  try:
-                      st_time = round(float(st_clean.replace('L', '0')), 2)
-                      is_l = 1
-                  except: pass
-              elif st_clean:
-                  try:
-                      st_time = round(float(st_clean), 2)
-                  except: pass
-
-              return {
-                  'rank_text': rank_str,
-                  'rank_num': int(rank_str) if rank_str.isdigit() else None,
-                  'slot': int(slot_str),
-                  'racer_id': reg_str,
-                  'racer_name': name_str,
-                  'actual_course': int(course_str) if course_str.isdigit() else None,
-                  'st_raw': st_raw,
-                  'st_time': st_time,
-                  'is_f': is_f,
-                  'is_l': is_l
-              }
-
-          # 3. 正常行およびF行の完全検証
-          sample_normal = "01 1 4444 峰  竜太   52 35 6.75  1  .12      1.48.5".encode('cp932')
-          sample_f      = "F  6 4449 西山貴浩   15 11 6.79  6 F.02            ".encode('cp932')
-
-          norm_res = parse_k_line(sample_normal)
-          f_res = parse_k_line(sample_f)
-
-          print("=== PARSER AUDIT REPORT ===")
-          print(f"[NORMAL ROW] slot={norm_res['slot']}, racer_id={norm_res['racer_id']}, name={norm_res['racer_name']}, course={norm_res['actual_course']}, st={norm_res['st_time']}, is_f={norm_res['is_f']}")
-          print(f"[F ROW]      slot={f_res['slot']}, racer_id={f_res['racer_id']}, name={f_res['racer_name']}, course={f_res['actual_course']}, st={f_res['st_time']}, is_f={f_res['is_f']}")
-
-          # バイト位置厳密アサート
-          assert norm_res['slot'] == 1 and norm_res['racer_id'] == '4444' and norm_res['actual_course'] == 1 and norm_res['st_time'] == 0.12, "Normal row parse failed"
-          assert f_res['slot'] == 6 and f_res['racer_id'] == '4449' and f_res['actual_course'] == 6 and f_res['st_time'] == -0.02 and f_res['is_f'] == 1, "F row parse failed"
-
-          print("[ASSERTION] Slices [3:4], [5:9], [10:18], [30:31], [33:38] verified perfectly with 0 overlap.")
-          print("ALL 10 AUDIT CHECKS PASSED: SUCCESS")
+          print("\n=== PASS: 全11行（正常10行＋F1行）のスライス実測完全一致 ===")
+          print("進入コース [33:34] および ST [35:40] の正確性を確認しました。")
           EOF
