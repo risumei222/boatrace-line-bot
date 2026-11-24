@@ -22,55 +22,59 @@ jobs:
 
       - name: Install tools
         run: |
-          sudo apt-get update && sudo apt-get install -y lhasa
+          pip install lhafile
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Fetch and Parse Boatrace Data
         run: |
           python - << 'EOF'
-          import inspect
           import json
-          import subprocess
           import urllib.request
           from pathlib import Path
-          from backtest_lab.parse_b import parse_b_bytes
-          from backtest_lab.parse_k_results import parse_k_results_bytes
-          import backtest_lab.build_dataset as bd
+          import lhafile
 
-          raw_dir = Path("bk_raw")
           lzh_dir = Path("bk_lzh")
-          raw_dir.mkdir(exist_ok=True)
           lzh_dir.mkdir(exist_ok=True)
 
-          dates = [f"2611{d:02d}" for d in range(10, 22)]
-          b_docs, k_docs = [], []
+          # 2026年11月1日〜24日分のデータを取得
+          dates = [f"2611{d:02d}" for d in range(1, 25)]
+          dataset = []
+
+          def read_lzh_text(lzh_path):
+              lf = lhafile.Lhafile(str(lzh_path))
+              for info in lf.infolist():
+                  if info.filename.lower().endswith(".txt"):
+                      return lf.read(info.filename).decode("cp932", errors="ignore")
+              return ""
 
           for d in dates:
               ym = "20" + d[:4]
+              texts = {}
               for kind in ["b", "k"]:
                   fname = f"{kind}{d}.lzh"
                   lzh_path = lzh_dir / fname
-                  url = f"http://www1.mbrace.or.jp/od2/{kind.upper()}/{ym}/{fname}"
+                  url = f"https://www1.mbrace.or.jp/od2/{kind.upper()}/{ym}/{fname}"
                   try:
                       urllib.request.urlretrieve(url, lzh_path)
-                      subprocess.run(["lha", "xw=" + str(raw_dir), str(lzh_path)], check=True)
+                      texts[kind] = read_lzh_text(lzh_path)
                   except Exception as e:
                       print(f"Skip {fname}: {e}")
 
-              b_txt = raw_dir / f"B{d}.TXT"
-              k_txt = raw_dir / f"K{d}.TXT"
-              if b_txt.exists() and k_txt.exists():
-                  b_docs.append(parse_b_bytes(b_txt.read_bytes()))
-                  k_docs.append(parse_k_results_bytes(k_txt.read_bytes()))
-
-          fn = bd.build_backtest_dataset
-          params = list(inspect.signature(fn).parameters.keys())
-          dataset = fn(b_docs, k_docs) if len(params) >= 2 else fn(raw_dir)
+              if texts.get("b") and texts.get("k"):
+                  dataset.append({
+                      "date": f"20{d[:2]}-{d[2:4]}-{d[4:6]}",
+                      "code": d,
+                      "b_lines": len(texts["b"].splitlines()),
+                      "k_lines": len(texts["k"].splitlines()),
+                      "b_text": texts["b"],
+                      "k_text": texts["k"],
+                  })
 
           Path("auto_dataset.json").write_text(
-              json.dumps(dataset, ensure_ascii=False, indent=2), encoding="utf-8"
+              json.dumps(dataset, ensure_ascii=False),
+              encoding="utf-8"
           )
-          print("auto_dataset.json saved successfully.")
+          print(f"auto_dataset.json saved: {len(dataset)} days")
           EOF
 
       - name: Commit and Push auto_dataset.json
@@ -80,4 +84,3 @@ jobs:
           git add auto_dataset.json
           git diff --cached --quiet || git commit -m "Update auto_dataset.json"
           git push
-
